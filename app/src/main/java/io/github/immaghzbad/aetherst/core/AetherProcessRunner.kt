@@ -693,13 +693,13 @@ class AetherProcessRunner(private val context: Context) {
             lower.contains("tls established") || lower.contains("tls handshake complete") -> {
                 updateState(ConnectionStatus.VALIDATING, attemptId)
             }
-            protocol == AetherProtocol.GOOL -> {
+            (protocol == AetherProtocol.GOOL || (exitNodeMode == ExitNodeMode.CUSTOM_WG && (protocol == AetherProtocol.WG || protocol == AetherProtocol.MASQUE))) -> {
                 when {
                     lower.contains("gool ready") ||
                     lower.contains("gool exit:") ||
                     lower.contains("warp-in-warp exit:") ||
                     (lower.contains("inner") && lower.contains("tunnel validated")) ||
-                    (goolOuterValidated && lower.contains("wireguard tunnel validated")) ||
+                    (goolOuterValidated && (lower.contains("wireguard tunnel validated") || lower.contains("[wg] handshake done") || lower.contains("[wg] handshake success") || lower.contains("could not read the exit of"))) ||
                     lower.contains("wiw ready") ||
                     lower.contains("warp-in-warp ready") ||
                     lower.contains("serving socks5") ||
@@ -748,7 +748,7 @@ class AetherProcessRunner(private val context: Context) {
                 dataPlaneOk = true
                 updateState(ConnectionStatus.DATAPLANE_VALIDATED, attemptId)
             }
-            (protocol != AetherProtocol.GOOL && protocol != AetherProtocol.MIM) && (
+            (protocol != AetherProtocol.GOOL && protocol != AetherProtocol.MIM && !(exitNodeMode == ExitNodeMode.CUSTOM_WG && (protocol == AetherProtocol.WG || protocol == AetherProtocol.MASQUE))) && (
                 lower.contains("tunnel validated") ||
                 lower.contains("data-plane verification passed") ||
                 lower.contains("data plane verification passed") ||
@@ -764,7 +764,7 @@ class AetherProcessRunner(private val context: Context) {
                     updateState(ConnectionStatus.SOCKS_READY, attemptId)
                 }
             }
-            (protocol != AetherProtocol.GOOL && protocol != AetherProtocol.MIM) && lower.contains("socks") && lower.contains("listening") -> {
+            (protocol != AetherProtocol.GOOL && protocol != AetherProtocol.MIM && !(exitNodeMode == ExitNodeMode.CUSTOM_WG && (protocol == AetherProtocol.WG || protocol == AetherProtocol.MASQUE))) && lower.contains("socks") && lower.contains("listening") -> {
                 quickRetryPending.set(false)
                 dataPlaneOk = true
                 SocksGate.setReady(SocksReadiness.PROBED_OK)
@@ -882,32 +882,59 @@ class AetherProcessRunner(private val context: Context) {
         command: MutableList<String>,
         env: MutableMap<String, String>
     ) {
-        // Clean up any stale .corrupt or custom-wg-inner files in root workDir so Layer-1 (WG / GOOL / MASQUE)
-        // always uses clean Cloudflare WARP identities without TOML deserialization failure (missing field 'ipv6').
         val innerFiles = listOf(
             java.io.File(workDir, "aether-gool.toml"),
             java.io.File(workDir, "aether-masque-gool.toml"),
             java.io.File(workDir, "aether-secondary.toml"),
             java.io.File(workDir, "aether-wg-secondary.toml")
         )
-        for (f in innerFiles) {
-            runCatching {
-                val corrupt = java.io.File(workDir, "${f.name}.corrupt")
-                if (corrupt.exists()) corrupt.delete()
-                if (f.exists()) {
-                    val txt = f.readText()
-                    if (txt.contains("custom-wg-inner") || !txt.contains("ipv6")) {
-                        f.delete()
+
+        if (config.exitNodeMode != ExitNodeMode.CUSTOM_WG || !config.customWgConfig.isValid()) {
+            for (f in innerFiles) {
+                runCatching {
+                    val corrupt = java.io.File(workDir, "${f.name}.corrupt")
+                    if (corrupt.exists()) corrupt.delete()
+                    if (f.exists()) {
+                        val txt = f.readText()
+                        if (txt.contains("custom-wg-inner") || !txt.contains("ipv6")) {
+                            f.delete()
+                        }
                     }
                 }
             }
+            return
         }
-        val customPriv = config.customWgConfig.privateKey.trim()
+
+        workDir.listFiles()?.forEach { f ->
+            if (f.name.endsWith(".corrupt")) runCatching { f.delete() }
+        }
+
+        val customWg = config.customWgConfig
+        val rawEndpoint = customWg.endpoint.trim()
+        val hostPart = if (rawEndpoint.startsWith("[")) {
+            rawEndpoint.substringAfter('[').substringBefore(']')
+        } else {
+            rawEndpoint.substringBeforeLast(':')
+        }.trim()
+        val portPart = rawEndpoint.substringAfterLast(':', "51820").trim().toIntOrNull() ?: 51820
+        val resolvedHost = runCatching {
+            if (hostPart.matches(Regex("""^\d{1,3}(\.\d{1,3}){3}$""")) || hostPart.contains(':')) {
+                hostPart
+            } else {
+                java.net.InetAddress.getAllByName(hostPart)
+                    .firstOrNull { it is java.net.Inet4Address }
+                    ?.hostAddress ?: hostPart
+            }
+        }.getOrDefault(hostPart)
+        val innerEndpoint = "$resolvedHost:$portPart"
+
+        val cleanIpv4 = customWg.addressV4.substringBefore('/').trim().ifBlank { "10.2.0.2" }
+        val cleanIpv6 = customWg.addressV6.substringBefore('/').trim().ifBlank { "fd00::2" }
+
+        val customPriv = customWg.privateKey.trim()
         for (outerName in listOf("aether.toml", "aether-wg.toml", "aether-masque.toml")) {
             val outerFile = java.io.File(workDir, outerName)
             runCatching {
-                val corrupt = java.io.File(workDir, "$outerName.corrupt")
-                if (corrupt.exists()) corrupt.delete()
                 if (outerFile.exists()) {
                     val txt = outerFile.readText()
                     if ((customPriv.isNotEmpty() && txt.contains(customPriv)) || !txt.contains("ipv6")) {
@@ -915,6 +942,80 @@ class AetherProcessRunner(private val context: Context) {
                     }
                 }
             }
+        }
+        val primaryOuter = java.io.File(workDir, "aether.toml")
+        if (!primaryOuter.exists() || primaryOuter.length() == 0L) {
+            runCatching {
+                val regPb = ProcessBuilder(binaryPath, "--register", "wg", "--config", primaryOuter.absolutePath)
+                regPb.directory(workDir)
+                val p = regPb.start()
+                p.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)
+                if (p.isAlive) p.destroyForcibly()
+            }
+        }
+
+        if (primaryOuter.exists() && primaryOuter.length() > 0L &&
+            (config.protocol == AetherProtocol.WG || config.protocol == AetherProtocol.GOOL || config.protocol == AetherProtocol.MASQUE)
+        ) {
+            val innerToml = buildString {
+                appendLine("""device_id = "custom-wg-inner"""")
+                appendLine("""access_token = "custom-wg-token"""")
+                appendLine("""ipv4 = "$cleanIpv4"""")
+                appendLine("""ipv6 = "$cleanIpv6"""")
+                appendLine("""wg_private_key = "${customWg.privateKey.trim()}"""")
+                appendLine("""wg_peer_public_key = "${customWg.publicKey.trim()}"""")
+                appendLine("""assigned_endpoint = "$innerEndpoint"""")
+                appendLine("""client_id = "AAAA"""")
+            }
+            for (f in innerFiles) {
+                runCatching { f.writeText(innerToml) }
+            }
+
+            val useClassic = config.protocol == AetherProtocol.WG || (config.protocol == AetherProtocol.GOOL && config.goolClassic)
+            command.removeAll(listOf("--wg", "--masque", "--gool", "--gool-classic", "--no-data-check"))
+
+            fun removeFlagWithArg(flag: String) {
+                var idx = command.indexOf(flag)
+                while (idx != -1) {
+                    command.removeAt(idx)
+                    if (idx < command.size) command.removeAt(idx)
+                    idx = command.indexOf(flag)
+                }
+            }
+            removeFlagWithArg("--wiw-inner")
+            removeFlagWithArg("--gool-peer")
+            removeFlagWithArg("--api-address")
+            removeFlagWithArg("--dns")
+
+            val customDns = customWg.dnsServers.firstOrNull { it.isNotBlank() } ?: "10.2.0.1"
+            val combinedDns = "$customDns,1.1.1.1,1.0.0.1"
+
+            if (useClassic) {
+                command.add("--gool-classic")
+                command.add("--wiw-inner")
+                command.add(innerEndpoint)
+                env["AETHER_PROTOCOL"] = "gool"
+                env["AETHER_GOOL_MODE"] = "classic"
+                env["AETHER_WIW_INNER_PEER"] = innerEndpoint
+            } else {
+                command.add("--gool")
+                command.add("--gool-peer")
+                command.add(innerEndpoint)
+                env["AETHER_PROTOCOL"] = "gool"
+                env["AETHER_GOOL_PEER"] = innerEndpoint
+            }
+
+            command.add("--api-address")
+            command.add("127.0.0.1:0")
+            command.add("--no-data-check")
+            command.add("--dns")
+            command.add(combinedDns)
+
+            env["AETHER_API_ADDRESS"] = "127.0.0.1:0"
+            env["AETHER_REPROVISION"] = "0"
+            env["AETHER_WG_NO_DATA_CHECK"] = "1"
+            env["AETHER_WG_STALE_SECS"] = "86400"
+            env["AETHER_DNS"] = combinedDns
         }
     }
 

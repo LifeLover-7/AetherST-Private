@@ -240,21 +240,42 @@ class WireGuardExitTunnel(
                 }
             }
 
-            // Quick check: if primarySocksPort is already exiting through a non-WARP inner WireGuard tunnel
+            val hasNativeInnerConfig = runCatching {
+                val sec = File(workDir, "aether-secondary.toml")
+                sec.exists() && sec.readText().contains("custom-wg-inner")
+            }.getOrDefault(false)
+
             if (primarySocksPort > 0 && isPortListening(primarySocksHost, primarySocksPort)) {
-                val primaryTrace = probeCloudflareTraceFull(primarySocksPort)
-                if (primaryTrace != null &&
-                    primaryTrace.country != "IR" &&
-                    primaryTrace.warpState.equals("off", ignoreCase = true)
-                ) {
-                    LogRepository.i(
-                        "[WgExit] Layer-1 port $primarySocksPort is already exiting via inner WireGuard " +
-                            "(IP: ${primaryTrace.ip}, Country: ${primaryTrace.country}). Starting local bridge on $localListenPort...",
-                        "WgExit"
-                    )
-                    if (startNativePassthroughBridge(localListenPort)) {
-                        verifiedExitIp = primaryTrace.ip
-                        return true
+                val traceAttempts = if (hasNativeInnerConfig) 3 else 1
+                for (attempt in 1..traceAttempts) {
+                    val primaryTrace = probeCloudflareTraceFull(primarySocksPort)
+                    if (primaryTrace != null &&
+                        primaryTrace.country != "IR" &&
+                        (primaryTrace.warpState.equals("off", ignoreCase = true) || hasNativeInnerConfig)
+                    ) {
+                        LogRepository.i(
+                            "[WgExit] Layer-1 port $primarySocksPort is already exiting via inner WireGuard " +
+                                "(IP: ${primaryTrace.ip}, Country: ${primaryTrace.country}, warp=${primaryTrace.warpState}). Starting local bridge on $localListenPort...",
+                            "WgExit"
+                        )
+                        if (startNativePassthroughBridge(localListenPort)) {
+                            verifiedExitIp = primaryTrace.ip
+                            return true
+                        }
+                    }
+                    if (hasNativeInnerConfig) {
+                        val fallbackIp = verifyDataPlane(primarySocksPort)
+                        if (fallbackIp != null) {
+                            LogRepository.i(
+                                "[WgExit] Layer-1 port $primarySocksPort native 2-layer data-plane verified (Exit IP: $fallbackIp). Starting local bridge on $localListenPort...",
+                                "WgExit"
+                            )
+                            if (startNativePassthroughBridge(localListenPort)) {
+                                verifiedExitIp = fallbackIp
+                                return true
+                            }
+                        }
+                        if (attempt < traceAttempts) Thread.sleep(800)
                     }
                 }
             }
@@ -410,6 +431,8 @@ class WireGuardExitTunnel(
                 "--gool-classic",
                 "--wiw-outer", outerEp,
                 "--wiw-inner", innerEp,
+                "--api-address", "127.0.0.1:0",
+                "--no-data-check",
                 "--noize", "balanced",
                 "-4",
                 "--keepalive", "15",
@@ -419,12 +442,15 @@ class WireGuardExitTunnel(
             val pb = ProcessBuilder(cmd)
             pb.directory(chainDir)
             val env = pb.environment()
+            env.remove("AETHER_EXIT_LOC")
             env["AETHER_PROTOCOL"] = "gool"
             env["AETHER_GOOL_MODE"] = "classic"
             env["AETHER_WIW_OUTER_PEER"] = outerEp
             env["AETHER_WIW_INNER_PEER"] = innerEp
+            env["AETHER_API_ADDRESS"] = "127.0.0.1:0"
             env["AETHER_REPROVISION"] = "0"
             env["AETHER_WG_NO_DATA_CHECK"] = "1"
+            env["AETHER_WG_STALE_SECS"] = "86400"
             env["AETHER_DNS"] = combinedDns
             env["AETHER_LOG_LEVEL"] = "debug"
             pb.redirectErrorStream(true)
@@ -540,6 +566,22 @@ class WireGuardExitTunnel(
         }
     }
 
+    private fun sendDirectUdpNoiseOpener(host: String, port: Int) {
+        runCatching {
+            val addr = InetAddress.getByName(host)
+            DatagramSocket().use { sock ->
+                val rng = SecureRandom()
+                for (sz in intArrayOf(38, 64, 92, 128, 76)) {
+                    val buf = ByteArray(sz)
+                    rng.nextBytes(buf)
+                    buf[0] = (0x80 or (buf[0].toInt() and 0x7F)).toByte()
+                    sock.send(DatagramPacket(buf, buf.size, addr, port))
+                    Thread.sleep(12)
+                }
+            }
+        }
+    }
+
     private fun tryStartSingBoxChain(
         binPath: String,
         workDir: File,
@@ -551,21 +593,10 @@ class WireGuardExitTunnel(
         mtu: Int
     ): Boolean {
         return try {
-            var effectiveWarpIdentity = warpIdentity
             if (warpIdentity != null) {
-                val relay = LocalWarpUdpRelay(warpIdentity.endpoint, warpIdentity.port)
-                if (relay.start() && relay.listenPort > 0) {
-                    udpRelay = relay
-                    effectiveWarpIdentity = warpIdentity.copy(
-                        endpoint = "127.0.0.1",
-                        port = relay.listenPort
-                    )
-                    LogRepository.i(
-                        "[WgExit] Same-5-Tuple LocalWarpUdpRelay active on 127.0.0.1:${relay.listenPort} -> ${warpIdentity.endpoint}:${warpIdentity.port}",
-                        "WgExit"
-                    )
-                }
+                sendDirectUdpNoiseOpener(warpIdentity.endpoint, warpIdentity.port)
             }
+            val effectiveWarpIdentity = warpIdentity
 
             val cfgJson = buildSingBoxConfig(
                 listenPort = localListenPort,
@@ -1088,6 +1119,33 @@ class WireGuardExitTunnel(
     ): WarpIdentity? {
         return try {
             if (!isRunning.get()) return null
+            val dedicatedFile = File(workDir, "aether-singbox-warp.toml")
+            val aetherBin = findAetherBinary(workDir)
+            if (aetherBin != null) {
+                runCatching {
+                    val regCmd = mutableListOf(
+                        aetherBin,
+                        "--register", "wg",
+                        "--config", dedicatedFile.absolutePath
+                    )
+                    if (aetherSocksPort > 0 && isPortListening("127.0.0.1", aetherSocksPort)) {
+                        regCmd.add("--upstream")
+                        regCmd.add("socks5://127.0.0.1:$aetherSocksPort")
+                    }
+                    val pb = ProcessBuilder(regCmd)
+                    pb.directory(workDir)
+                    val p = pb.start()
+                    p.waitFor(10, TimeUnit.SECONDS)
+                    if (p.isAlive) p.destroyForcibly()
+                    if (dedicatedFile.exists() && dedicatedFile.length() > 0L) {
+                        val parsed = parseWarpIdentityFromToml(dedicatedFile, config.privateKey.trim(), bestEndpoint)
+                        if (parsed != null) {
+                            LogRepository.i("[WgExit] Registered dedicated secondary WARP identity via native aether --register wg", "WgExit")
+                            return parsed.copy(endpoint = bestEndpoint.first, port = bestEndpoint.second)
+                        }
+                    }
+                }
+            }
             val keyPair = WireGuardCrypto.generateKeyPair()
             val regBody = """{"key":"${keyPair.publicKey}","install_id":"","fcm_token":"","tos":"2026-01-01T00:00:00.000Z","model":"PC","serial_number":"${UUID.randomUUID()}","locale":"en_US"}"""
             val targets = listOf(
