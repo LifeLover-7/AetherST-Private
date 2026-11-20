@@ -243,18 +243,8 @@ if (!canReachGatewayOrInternet()) {
 
                 if (!coreReady) break
 
-                // Check if GOOL neighbor egress preference is enabled
-                if (effectiveConfig.protocol == AetherProtocol.GOOL && effectiveConfig.goolNeighborEgress && reroll < maxGoolRerolls) {
-                    val exitInfo = IpInfoRepository.fetchExitCountry("127.0.0.1", coreSocksPort, useProxy = true)
-                    val cc = exitInfo?.countryCode?.uppercase().orEmpty()
-                    if (cc.isNotEmpty() && cc !in neighborCountries) {
-                        LogRepository.w("[GOOL] Detected distant exit ($cc - ${exitInfo?.ip}); retrying for neighboring country...", "GOOL")
-                        continue
-                    } else if (cc in neighborCountries) {
-                        LogRepository.i("[GOOL] Locked onto neighboring exit country: $cc (${exitInfo?.ip})", "GOOL")
-                        break
-                    }
-                }
+                // Do not kill validated GOOL connections when Cloudflare WARP tags its FRA/GYD egress pool as IR
+                break
                 break
             }
 

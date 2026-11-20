@@ -699,10 +699,12 @@ class AetherProcessRunner(private val context: Context) {
                     lower.contains("gool exit:") ||
                     lower.contains("warp-in-warp exit:") ||
                     (lower.contains("inner") && lower.contains("tunnel validated")) ||
-                    (goolOuterValidated && (lower.contains("wireguard tunnel validated") || lower.contains("[wg] handshake done") || lower.contains("[wg] handshake success") || lower.contains("could not read the exit of"))) ||
+                    (goolOuterValidated && !lower.contains("[outer]") && (lower.contains("wireguard tunnel validated") || lower.contains("[wg] handshake done") || lower.contains("[wg] handshake success") || lower.contains("could not read the exit of"))) ||
                     lower.contains("wiw ready") ||
                     lower.contains("warp-in-warp ready") ||
-                    lower.contains("serving socks5") ||
+                    (goolOuterValidated && lower.contains("serving socks5") && !lower.contains("[outer]")) ||
+                    (lower.contains("socks") && lower.contains("listening") && lower.contains("1819")) ||
+                    (lower.contains("socks") && lower.contains("listening") && (lower.contains("2021") || (lastBindAddress.isNotEmpty() && lower.contains(lastBindAddress.lowercase())))) ||
                     (lower.contains("exit location") && lower.contains("accepted")) -> {
                         quickRetryPending.set(false)
                         dataPlaneOk = true
@@ -713,7 +715,6 @@ class AetherProcessRunner(private val context: Context) {
                     lower.contains("registering the gool") ||
                     (lower.contains("inner endpoint") && lower.contains("tunneled through outer")) ||
                     lower.contains("establishing inner warp tunnel") ||
-                    lower.contains("validating wireguard tunnel") ||
                     lower.contains("connect-ip status: 200") ||
                     lower.contains("connect-ip established") ||
                     (lower.contains("tunnel validated") && !lower.contains("inner")) -> {
@@ -760,7 +761,9 @@ class AetherProcessRunner(private val context: Context) {
                 dataPlaneOk = true
                 SocksGate.setReady(SocksReadiness.PROBED_OK)
                 updateState(ConnectionStatus.DATAPLANE_VALIDATED, attemptId)
-                if (lower.contains("serving socks5") || lower.contains("exposing socks5")) {
+                if ((goolOuterValidated && lower.contains("serving socks5") && !lower.contains("[outer]")) ||
+                    (lower.contains("socks") && lower.contains("listening") && lower.contains("1819")) ||
+                    (lower.contains("socks") && lower.contains("listening") && (lower.contains("2021") || (lastBindAddress.isNotEmpty() && lower.contains(lastBindAddress.lowercase())))) || lower.contains("exposing socks5")) {
                     updateState(ConnectionStatus.SOCKS_READY, attemptId)
                 }
             }
@@ -896,7 +899,7 @@ class AetherProcessRunner(private val context: Context) {
                     if (corrupt.exists()) corrupt.delete()
                     if (f.exists()) {
                         val txt = f.readText()
-                        if (txt.contains("custom-wg-inner") || !txt.contains("ipv6")) {
+                        if (txt.contains("custom-wg-inner")) {
                             f.delete()
                         }
                     }
@@ -1002,16 +1005,17 @@ class AetherProcessRunner(private val context: Context) {
                 command.add("--gool-peer")
                 command.add(innerEndpoint)
                 env["AETHER_PROTOCOL"] = "gool"
+                env["AETHER_GOOL_INNER"] = innerEndpoint
                 env["AETHER_GOOL_PEER"] = innerEndpoint
             }
 
             command.add("--api-address")
-            command.add("127.0.0.1:0")
+            command.add("127.0.0.1:1")
             command.add("--no-data-check")
             command.add("--dns")
             command.add(combinedDns)
 
-            env["AETHER_API_ADDRESS"] = "127.0.0.1:0"
+            env["AETHER_API_ADDRESS"] = "127.0.0.1:1"
             env["AETHER_REPROVISION"] = "0"
             env["AETHER_WG_NO_DATA_CHECK"] = "1"
             env["AETHER_WG_STALE_SECS"] = "86400"

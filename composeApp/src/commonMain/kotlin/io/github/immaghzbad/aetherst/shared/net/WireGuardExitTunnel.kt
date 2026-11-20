@@ -26,7 +26,6 @@ import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
 /**
@@ -432,7 +431,7 @@ class WireGuardExitTunnel(
                 "--gool-classic",
                 "--wiw-outer", outerEp,
                 "--wiw-inner", innerEp,
-                "--api-address", "127.0.0.1:0",
+                "--api-address", "127.0.0.1:1",
                 "--no-data-check",
                 "--noize", "balanced",
                 "-4",
@@ -448,7 +447,7 @@ class WireGuardExitTunnel(
             env["AETHER_GOOL_MODE"] = "classic"
             env["AETHER_WIW_OUTER_PEER"] = outerEp
             env["AETHER_WIW_INNER_PEER"] = innerEp
-            env["AETHER_API_ADDRESS"] = "127.0.0.1:0"
+            env["AETHER_API_ADDRESS"] = "127.0.0.1:1"
             env["AETHER_REPROVISION"] = "0"
             env["AETHER_WG_NO_DATA_CHECK"] = "1"
             env["AETHER_WG_STALE_SECS"] = "86400"
@@ -463,7 +462,7 @@ class WireGuardExitTunnel(
             val innerHandshakeDone = AtomicBoolean(false)
             val innerReadySignal = AtomicBoolean(false)
             val innerFailedSignal = AtomicBoolean(false)
-            val loggedExitIp = AtomicReference<String?>(null)
+            @Volatile var loggedExitIp: String? = null
             val exitRegex = Regex("""(?i)\b(?:warp-in-warp|gool)\s+exit:\s*([0-9a-fA-F.:]+),\s*([A-Za-z]{2})""")
             val acceptedRegex = Regex("""(?i)exit\s+location\s+([A-Za-z]{2})\s+accepted\s*\(([0-9a-fA-F.:]+)\)""")
 
@@ -481,7 +480,7 @@ class WireGuardExitTunnel(
                                 val ip = m.groupValues[1].trim()
                                 val cc = m.groupValues[2].trim().uppercase()
                                 if (ip.isNotEmpty() && cc != "IR") {
-                                    loggedExitIp.set(ip)
+                                    loggedExitIp = ip
                                     innerReadySignal.set(true)
                                 }
                             }
@@ -489,7 +488,7 @@ class WireGuardExitTunnel(
                                 val cc = m.groupValues[1].trim().uppercase()
                                 val ip = m.groupValues[2].trim()
                                 if (ip.isNotEmpty() && cc != "IR") {
-                                    loggedExitIp.set(ip)
+                                    loggedExitIp = ip
                                     innerReadySignal.set(true)
                                 }
                             }
@@ -519,7 +518,7 @@ class WireGuardExitTunnel(
                 if (!proc.isAlive || innerFailedSignal.get()) break
 
                 if (innerReadySignal.get()) {
-                    val exitIp = loggedExitIp.get() ?: innerHost
+                    val exitIp = loggedExitIp ?: innerHost
                     verifiedExitIp = exitIp
                     LogRepository.i(
                         "[WgExit] Engine 1 (Native Aether 2-Layer WireGuard) verified via exitloc! Exit IP: $exitIp",
@@ -531,7 +530,7 @@ class WireGuardExitTunnel(
                 if (innerHandshakeDone.get()) {
                     Thread.sleep(300)
                     if (innerReadySignal.get()) {
-                        val exitIp = loggedExitIp.get() ?: innerHost
+                        val exitIp = loggedExitIp ?: innerHost
                         verifiedExitIp = exitIp
                         LogRepository.i(
                             "[WgExit] Engine 1 (Native Aether 2-Layer WireGuard) verified! Exit IP: $exitIp",
@@ -549,7 +548,7 @@ class WireGuardExitTunnel(
                         return true
                     }
                     if (innerReadySignal.get() || proc.isAlive) {
-                        val fallbackIp = loggedExitIp.get() ?: innerHost
+                        val fallbackIp = loggedExitIp ?: innerHost
                         verifiedExitIp = fallbackIp
                         LogRepository.i(
                             "[WgExit] Engine 1 (Native Aether 2-Layer WireGuard) inner handshake active! Exit: $fallbackIp",

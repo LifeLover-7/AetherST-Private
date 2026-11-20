@@ -313,8 +313,15 @@ class FirefoxVpnExitTunnel(
                 underlying.keepAlive = true
                 underlying.soTimeout = 0
 
+                val edgeTrustAll = arrayOf<javax.net.ssl.TrustManager>(
+                    object : javax.net.ssl.X509TrustManager {
+                        override fun checkClientTrusted(chain: Array<java.security.cert.X509Certificate>?, authType: String?) {}
+                        override fun checkServerTrusted(chain: Array<java.security.cert.X509Certificate>?, authType: String?) {}
+                        override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = emptyArray()
+                    }
+                )
                 val sslContext = SSLContext.getInstance("TLS")
-                sslContext.init(null, null, null)
+                sslContext.init(null, edgeTrustAll, SecureRandom())
                 val ssl = (sslContext.socketFactory.createSocket(underlying, edgeHost, edgePort, true) as SSLSocket).apply {
                     val params = sslParameters
                     runCatching { params.serverNames = listOf(SNIHostName(edgeHost)) }

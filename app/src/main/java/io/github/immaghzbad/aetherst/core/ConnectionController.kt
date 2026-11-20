@@ -148,19 +148,26 @@ class ConnectionController private constructor(context: Context) : ConnectionCon
             val config = AetherConfigRepository.getInstance(getSettings(PlatformContext(appContext))).config.value.effectiveZeroTrustConfig()
             var effectiveConfig = config
 
-            if (effectiveConfig.protocol == AetherProtocol.GOOL) {
+            if (effectiveConfig.exitNodeMode != ExitNodeMode.PSIPHON_POOL) {
+                effectiveConfig = effectiveConfig.copy(psiphonEnabled = false, psiphonOnly = false)
+            }
+
+            if (effectiveConfig.protocol == AetherProtocol.GOOL || effectiveConfig.protocol == AetherProtocol.MIM) {
                 effectiveConfig = effectiveConfig.copy(
                     ipMode = if (effectiveConfig.ipMode == AetherIpMode.AUTO) AetherIpMode.IPV4 else effectiveConfig.ipMode,
                     noise = if (effectiveConfig.noise == AetherNoise.OFF) AetherNoise.BALANCED else effectiveConfig.noise,
+                    scanMode = if (effectiveConfig.scanMode == AetherScanMode.BALANCED) AetherScanMode.TURBO else effectiveConfig.scanMode,
+                    httpVersion = MasqueHttpVersion.H2,
                     h2Mode = true,
                     h2Fragment = true,
                     fragmentSize = effectiveConfig.fragmentSize.ifBlank { "30-60" },
                     fragmentDelay = effectiveConfig.fragmentDelay.ifBlank { "5-15" },
                     masqueSni = effectiveConfig.masqueSni.ifBlank { "consumer-masque.cloudflareclient.com" },
+                    masqueMtu = if (effectiveConfig.protocol == AetherProtocol.MIM) 1500 else effectiveConfig.masqueMtu,
                     mtu = effectiveConfig.mtu.coerceIn(1120, 1280),
                     validateSecs = effectiveConfig.validateSecs.coerceAtLeast(15)
                 )
-            } else if (effectiveConfig.protocol == AetherProtocol.MASQUE || effectiveConfig.protocol == AetherProtocol.MIM) {
+            } else if (effectiveConfig.protocol == AetherProtocol.MASQUE) {
                 if (effectiveConfig.masqueSni.isBlank()) {
                     effectiveConfig = effectiveConfig.copy(masqueSni = "consumer-masque.cloudflareclient.com")
                 }
@@ -173,8 +180,13 @@ class ConnectionController private constructor(context: Context) : ConnectionCon
                     LogRepository.i("[Controller] Cloak active, routing MASQUE via ${effectiveConfig.peer}")
                 }
             }
-            val psiphonSupported = PsiphonController.isSupported(effectiveConfig) && effectiveConfig.chainProvider == ChainProvider.PSIPHON
-            val torSupported = TorController.isSupported(effectiveConfig) && effectiveConfig.chainProvider == ChainProvider.TOR
+            val psiphonSupported = effectiveConfig.exitNodeMode == ExitNodeMode.PSIPHON_POOL &&
+                PsiphonController.isSupported(effectiveConfig) &&
+                effectiveConfig.chainProvider == ChainProvider.PSIPHON
+            val torSupported = effectiveConfig.exitNodeMode == ExitNodeMode.DIRECT &&
+                effectiveConfig.torEnabled &&
+                TorController.isSupported(effectiveConfig) &&
+                effectiveConfig.chainProvider == ChainProvider.TOR
 
             if (psiphonSupported && !effectiveConfig.psiphonOnly) {
                 val coreSocks = effectiveConfig.socksPort.toIntOrNull() ?: 2021
@@ -1008,56 +1020,64 @@ class ConnectionController private constructor(context: Context) : ConnectionCon
         mimGuardActive = false
         Bridge.mimGuardActive = false
 
-        val maxRerolls = if (config.protocol == AetherProtocol.GOOL && config.goolNeighborEgress) 3 else 1
-        for (reroll in 1..maxRerolls) {
-            if (reroll > 1) {
-                LogRepository.i("[GOOL] Exit country was distant; re-rolling endpoint ($reroll/$maxRerolls)...")
-                runner.stop()
-                delay(600.milliseconds)
-                if (activeAttemptId.get() != attemptId) return false
-                notifyStatusChanged(appContext, ConnectionStatus.STARTING)
-            }
-
-            var validatedOk = try {
-                startAetherValidated(config, bindAddress, attemptId)
-            } catch (e: Exception) {
-                if (config.protocol == AetherProtocol.GOOL && !config.goolClassic) {
+        var validatedOk = try {
+            startAetherValidated(config, bindAddress, attemptId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            when {
+                config.exitNodeMode == ExitNodeMode.CUSTOM_WG -> {
+                    LogRepository.w("[WG-Chain] Native Layer-1 chain failed (${e.message}); falling back to fast Layer-1 WG + Layer-2 WireGuardExitTunnel...")
+                    false
+                }
+                config.protocol == AetherProtocol.GOOL && !config.goolClassic -> {
                     LogRepository.w("[GOOL] MASQUE-based GOOL failed (${e.message}); falling back to Classic GOOL (WireGuard-in-WireGuard)...")
                     false
-                } else {
-                    throw e
                 }
+                config.protocol == AetherProtocol.MIM -> {
+                    LogRepository.w("[MIM] Dual-MASQUE failed (${e.message}); falling back to MASQUE-carrier GOOL...")
+                    false
+                }
+                else -> throw e
             }
-            if (!validatedOk && config.protocol == AetherProtocol.GOOL && !config.goolClassic) {
-                runner.stop()
-                delay(500.milliseconds)
-                if (activeAttemptId.get() != attemptId) return false
-                notifyStatusChanged(appContext, ConnectionStatus.STARTING)
-                validatedOk = startAetherValidated(config.copy(goolClassic = true), bindAddress, attemptId)
-            }
-            if (!validatedOk) {
-                return false
-            }
-            if (activeAttemptId.get() != attemptId) return false
+        }
 
-            if (config.protocol == AetherProtocol.GOOL && config.goolNeighborEgress && reroll < maxRerolls) {
-                val exit = lookupTunnelExitCountry(config, attemptId)
-                if (exit != null && exit !in neighborCountries) {
-                    LogRepository.w("[GOOL] Detected distant exit ($exit); retrying for neighboring country...")
-                    continue
-                } else if (exit != null) {
-                    LogRepository.i("[GOOL] Locked onto neighboring exit country: $exit")
-                    break
+        if (!validatedOk && activeAttemptId.get() == attemptId) {
+            when {
+                config.exitNodeMode == ExitNodeMode.CUSTOM_WG -> {
+                    runner.stop()
+                    delay(400.milliseconds)
+                    if (activeAttemptId.get() != attemptId) return false
+                    notifyStatusChanged(appContext, ConnectionStatus.STARTING)
+                    // Start plain Layer-1 WG on 127.0.0.1:1819 so WireGuardExitTunnel handles Layer-2 Proton WG
+                    validatedOk = startAetherValidated(config.copy(exitNodeMode = ExitNodeMode.DIRECT), bindAddress, attemptId)
                 }
-            } else {
-                scope.launch {
-                    val exit = lookupTunnelExitCountry(config, attemptId)
-                    if (exit != null) {
-                        LogRepository.i("[ExitGuard] Exit country confirmed: $exit (Protocol: ${config.protocol})")
-                    }
+                config.protocol == AetherProtocol.GOOL && !config.goolClassic -> {
+                    runner.stop()
+                    delay(400.milliseconds)
+                    if (activeAttemptId.get() != attemptId) return false
+                    notifyStatusChanged(appContext, ConnectionStatus.STARTING)
+                    validatedOk = startAetherValidated(config.copy(goolClassic = true), bindAddress, attemptId)
+                }
+                config.protocol == AetherProtocol.MIM -> {
+                    runner.stop()
+                    delay(400.milliseconds)
+                    if (activeAttemptId.get() != attemptId) return false
+                    notifyStatusChanged(appContext, ConnectionStatus.STARTING)
+                    validatedOk = startAetherValidated(config.copy(protocol = AetherProtocol.GOOL, mimEnabled = false, goolClassic = false), bindAddress, attemptId)
                 }
             }
-            break
+        }
+
+        if (!validatedOk || activeAttemptId.get() != attemptId) {
+            return false
+        }
+
+        scope.launch {
+            val exit = lookupTunnelExitCountry(config, attemptId)
+            if (exit != null) {
+                LogRepository.i("[ExitGuard] Exit country confirmed: $exit (Protocol: ${config.protocol})")
+            }
         }
 
         return finishCoreStart(config, attemptId)
@@ -1187,12 +1207,13 @@ class ConnectionController private constructor(context: Context) : ConnectionCon
                 continue
             }
             val stalledMs = System.currentTimeMillis() - lastProgressAt
+            val maxStallMs = if (config.exitNodeMode == ExitNodeMode.CUSTOM_WG || config.protocol == AetherProtocol.MIM) 24_000L else 180_000L
             if (stalledMs > 120_000 && !stallWarned) {
                 LogRepository.w("[Controller] Core stalled without progress for ${stalledMs / 1000}s while awaiting data-plane validation (still waiting for core verdict)")
                 stallWarned = true
             }
-            if (stalledMs > 180_000) {
-                throw IllegalStateException("Core stalled: no data-plane validation after 180s without status change (core did not report success or failure)")
+            if (stalledMs > maxStallMs) {
+                throw IllegalStateException("Core stalled: no data-plane validation after ${maxStallMs / 1000}s without status change")
             }
             delay(250.milliseconds)
         }
