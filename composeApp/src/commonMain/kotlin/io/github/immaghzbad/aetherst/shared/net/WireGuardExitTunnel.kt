@@ -593,10 +593,20 @@ class WireGuardExitTunnel(
         mtu: Int
     ): Boolean {
         return try {
+            var effectiveWarpIdentity = warpIdentity
             if (warpIdentity != null) {
-                sendDirectUdpNoiseOpener(warpIdentity.endpoint, warpIdentity.port)
+                val relay = LocalWarpUdpRelay(warpIdentity.endpoint, warpIdentity.port)
+                if (relay.start() && relay.listenPort > 0) {
+                    udpRelay = relay
+                    effectiveWarpIdentity = warpIdentity.copy(endpoint = "127.0.0.1", port = relay.listenPort)
+                    LogRepository.i(
+                        "[WgExit] LocalWarpUdpRelay active on 127.0.0.1:${relay.listenPort} -> ${warpIdentity.endpoint}:${warpIdentity.port}",
+                        "WgExit"
+                    )
+                } else {
+                    sendDirectUdpNoiseOpener(warpIdentity.endpoint, warpIdentity.port)
+                }
             }
-            val effectiveWarpIdentity = warpIdentity
 
             val cfgJson = buildSingBoxConfig(
                 listenPort = localListenPort,
