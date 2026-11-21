@@ -134,3 +134,39 @@ dependencies {
   debugImplementation(libs.androidx.compose.ui.test.manifest)
   debugImplementation(libs.androidx.compose.ui.tooling)
 }
+
+tasks.register("prepareSingBox114") {
+  doLast {
+    val legacyBridge = file("src/main/java/io/github/immaghzbad/aetherst/core/SocksTunBridge.kt")
+    if (legacyBridge.exists()) {
+      legacyBridge.delete()
+      println("==> Deleted legacy SocksTunBridge.kt")
+    }
+    val jniDir = file("src/main/jniLibs/arm64-v8a")
+    jniDir.mkdirs()
+    val targetSo = File(jniDir, "libsing-box.so")
+    if (!targetSo.exists() || targetSo.length() < 1024 * 1024) {
+      println("==> Downloading official Sing-box v1.14.4 Android arm64 binary...")
+      try {
+        val pb = ProcessBuilder(
+          "sh", "-c",
+          "curl -L -sS https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-android-arm64.tar.gz -o sb114.tar.gz && " +
+          "tar -xzf sb114.tar.gz && " +
+          "cp sing-box-1.14.4-android-arm64/sing-box src/main/jniLibs/arm64-v8a/libsing-box.so && " +
+          "chmod 755 src/main/jniLibs/arm64-v8a/libsing-box.so && " +
+          "rm -rf sb114.tar.gz sing-box-1.14.4-android-arm64"
+        )
+        pb.directory(projectDir)
+        pb.inheritIO()
+        val code = pb.start().waitFor()
+        println("==> Sing-box v1.14.4 bundle result code: $code (size=${targetSo.length()})")
+      } catch (e: Exception) {
+        println("==> Sing-box v1.14.4 download warning: ${e.message}")
+      }
+    }
+  }
+}
+
+tasks.matching { it.name == "preBuild" }.configureEach {
+  dependsOn("prepareSingBox114")
+}

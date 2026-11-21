@@ -28,20 +28,23 @@ object BinaryManager {
             }
         }
 
-        throw IOException("No compatible Aether core binary found for device ABIs: ${supportedAbis.joinToString(", ")}")
+        throw IOException("No compatible core binary found for device ABIs: ${supportedAbis.joinToString(", ")}")
     }
 
+    /**
+     * Resolves the Sing-box core binary (`libsing-box.so` / `sing-box`) as the primary network engine.
+     * Falls back to `libaether.so` only if `libsing-box.so` is not yet bundled in the APK.
+     */
     @Synchronized
     fun prepareBinary(context: Context): File {
+        prepareSingBoxBinary(context)?.let { return it }
+
         val archInfo = detectArchitecture()
         val nativeLibDir = context.applicationInfo.nativeLibraryDir
         val bundledBinary = File(nativeLibDir, "libaether.so")
 
         if (bundledBinary.exists() && bundledBinary.isFile && bundledBinary.length() > 0) {
-            if (bundledBinary.canExecute()) {
-                return bundledBinary
-            }
-
+            if (bundledBinary.canExecute()) return bundledBinary
             try {
                 makeExecutable(bundledBinary)
                 if (bundledBinary.canExecute()) return bundledBinary
@@ -55,26 +58,31 @@ object BinaryManager {
             throw IOException("Failed to create binary directory: ${binDir.absolutePath}")
         }
 
-        val targetFile = File(binDir, "aether_core")
-        val sourceFile = File(binDir, "aether-${archInfo.targetName}")
+        val targetFile = File(binDir, "sing-box")
+        if (targetFile.exists() && targetFile.isFile && targetFile.length() > 0) {
+            if (targetFile.canExecute()) return targetFile
+            makeExecutable(targetFile)
+            if (targetFile.canExecute()) return targetFile
+        }
 
-        // Fallback: extract libaether.so directly from APK if not extracted by package installer
+        val legacyTarget = File(binDir, "aether_core")
         if (!bundledBinary.exists() || !bundledBinary.canExecute()) {
             try {
                 val apkFile = File(context.applicationInfo.sourceDir)
                 if (apkFile.exists() && apkFile.isFile) {
                     java.util.zip.ZipFile(apkFile).use { zip ->
-                        val entryName = "lib/${archInfo.abi}/libaether.so"
-                        val entry = zip.getEntry(entryName)
+                        val entry = zip.getEntry("lib/${archInfo.abi}/libsing-box.so")
+                            ?: zip.getEntry("lib/${archInfo.abi}/libaether.so")
                         if (entry != null) {
-                            val tempFile = File(binDir, "aether_core.tmp")
+                            val tempFile = File(binDir, "core.tmp")
                             zip.getInputStream(entry).use { input ->
                                 tempFile.outputStream().use { output -> input.copyTo(output) }
                             }
                             makeExecutable(tempFile)
-                            if (tempFile.renameTo(targetFile) || (targetFile.delete() && tempFile.renameTo(targetFile))) {
-                                makeExecutable(targetFile)
-                                if (targetFile.canExecute()) return targetFile
+                            val dest = if (entry.name.contains("sing-box")) targetFile else legacyTarget
+                            if (tempFile.renameTo(dest) || (dest.delete() && tempFile.renameTo(dest))) {
+                                makeExecutable(dest)
+                                if (dest.canExecute()) return dest
                             }
                         }
                     }
@@ -84,40 +92,29 @@ object BinaryManager {
             }
         }
 
-        if (sourceFile.exists() && sourceFile.isFile && sourceFile.length() > 0) {
-            val tempFile = File(binDir, "aether_core.tmp")
-            try {
-                sourceFile.copyTo(tempFile, overwrite = true)
-                makeExecutable(tempFile)
-                if (!tempFile.renameTo(targetFile)) {
-                    throw IOException("Failed to rename temporary binary to final destination.")
-                }
-            } finally {
-                if (tempFile.exists()) tempFile.delete()
-            }
+        if (legacyTarget.exists() && legacyTarget.isFile && legacyTarget.length() > 0) {
+            if (legacyTarget.canExecute()) return legacyTarget
+            makeExecutable(legacyTarget)
+            if (legacyTarget.canExecute()) return legacyTarget
         }
 
-        if (targetFile.exists() && targetFile.isFile && targetFile.length() > 0) {
-            if (targetFile.canExecute()) return targetFile
-            makeExecutable(targetFile)
-            if (targetFile.canExecute()) return targetFile
-        }
-
-        throw IOException("Aether core binary is missing or not executable for architecture: ${archInfo.abi}")
+        throw IOException("Sing-box core binary is missing or not executable for architecture: ${archInfo.abi}")
     }
 
     @Synchronized
     fun prepareSingBoxBinary(context: Context): File? {
         val archInfo = runCatching { detectArchitecture() }.getOrNull()
         val nativeLibDir = context.applicationInfo.nativeLibraryDir
-        val bundledBinary = File(nativeLibDir, "libsing-box.so")
 
-        if (bundledBinary.exists() && bundledBinary.isFile && bundledBinary.length() > 0) {
-            if (bundledBinary.canExecute()) return bundledBinary
-            try {
-                makeExecutable(bundledBinary)
+        for (soName in listOf("libsing-box.so", "libsingbox.so")) {
+            val bundledBinary = File(nativeLibDir, soName)
+            if (bundledBinary.exists() && bundledBinary.isFile && bundledBinary.length() > 0) {
                 if (bundledBinary.canExecute()) return bundledBinary
-            } catch (_: Exception) {}
+                try {
+                    makeExecutable(bundledBinary)
+                    if (bundledBinary.canExecute()) return bundledBinary
+                } catch (_: Exception) {}
+            }
         }
 
         val binDir = File(context.filesDir, "bin")
@@ -132,14 +129,27 @@ object BinaryManager {
             } catch (_: Exception) {}
         }
 
+        // Check assets/bin/sing-box if packaged in assets
+        try {
+            context.assets.open("bin/sing-box").use { input ->
+                val tempFile = File(binDir, "sing-box.tmp")
+                tempFile.outputStream().use { output -> input.copyTo(output) }
+                makeExecutable(tempFile)
+                if (tempFile.renameTo(targetFile) || (targetFile.delete() && tempFile.renameTo(targetFile))) {
+                    makeExecutable(targetFile)
+                    if (targetFile.canExecute()) return targetFile
+                }
+            }
+        } catch (_: Exception) {}
+
         // Check if bundled inside APK zip
         if (archInfo != null) {
             try {
                 val apkFile = File(context.applicationInfo.sourceDir)
                 if (apkFile.exists() && apkFile.isFile) {
                     java.util.zip.ZipFile(apkFile).use { zip ->
-                        val entryName = "lib/${archInfo.abi}/libsing-box.so"
-                        val entry = zip.getEntry(entryName)
+                        val entry = zip.getEntry("lib/${archInfo.abi}/libsing-box.so")
+                            ?: zip.getEntry("lib/${archInfo.abi}/libsingbox.so")
                         if (entry != null) {
                             val tempFile = File(binDir, "sing-box.tmp")
                             zip.getInputStream(entry).use { input ->
@@ -163,11 +173,7 @@ object BinaryManager {
         try {
             val pb = ProcessBuilder("chmod", "700", file.absolutePath)
             val proc = pb.start()
-            val exitCode = proc.waitFor()
-            if (exitCode != 0) {
-                val err = runCatching { proc.errorStream.bufferedReader().readText() }.getOrNull()?.trim()
-                LogRepository.w("chmod 700 failed for ${file.name} exit=$exitCode err=${err ?: "?"}")
-            }
+            proc.waitFor()
         } catch (e: Exception) {
             LogRepository.w("chmod 700 exception for ${file.name}: ${e.message}")
         }

@@ -17,6 +17,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.io.File
 import java.net.InetSocketAddress
 import java.net.Socket
 import kotlin.time.Duration.Companion.milliseconds
@@ -84,8 +85,6 @@ actual object ConnectionController {
         private var watchdogJob: Job? = null
         private var reconnectJob: Job? = null
 
-        private val neighborCountries = setOf("TR", "AZ", "AM", "GE", "AE", "OM", "IQ", "BH", "KW", "QA")
-
         init {
             scope.launch {
                 Bridge.statusOverride.collect { s ->
@@ -137,31 +136,14 @@ actual object ConnectionController {
         }
 
         private suspend fun doStart() {
-            LogRepository.i("[Controller] Initializing connection process...", "AetherSystem")
-if (!canReachGatewayOrInternet()) {
+            LogRepository.i("[Controller] Initializing Sing-box connection process...", "AetherSystem")
+            if (!canReachGatewayOrInternet()) {
                 throw IllegalStateException("No internet connection detected")
             }
             val config = AetherConfigRepository.getInstance(getSettings(context)).config.value.effectiveZeroTrustConfig()
             var effectiveConfig = config
 
-            // تنظیم بهینه GOOL مطابق معماری مدرن Aether v2.4.0 (تونل WireGuard داخل MASQUE)
-            if (effectiveConfig.protocol == AetherProtocol.GOOL) {
-                effectiveConfig = effectiveConfig.copy(
-                    ipMode = if (effectiveConfig.ipMode == AetherIpMode.AUTO) AetherIpMode.IPV4 else effectiveConfig.ipMode,
-                    noise = if (effectiveConfig.noise == AetherNoise.OFF) AetherNoise.BALANCED else effectiveConfig.noise,
-                    h2Mode = true,
-                    h2Fragment = true,
-                    fragmentSize = effectiveConfig.fragmentSize.ifBlank { "30-60" },
-                    fragmentDelay = effectiveConfig.fragmentDelay.ifBlank { "5-15" },
-                    masqueSni = effectiveConfig.masqueSni.ifBlank { "consumer-masque.cloudflareclient.com" },
-                    mtu = effectiveConfig.mtu.coerceIn(1120, 1280),
-                    validateSecs = effectiveConfig.validateSecs.coerceAtLeast(15)
-                )
-            } else if (effectiveConfig.protocol == AetherProtocol.MASQUE || effectiveConfig.protocol == AetherProtocol.MIM) {
-                if (effectiveConfig.masqueSni.isBlank()) {
-                    effectiveConfig = effectiveConfig.copy(masqueSni = "consumer-masque.cloudflareclient.com")
-                }
-            } else if (CloakController.isSupported(effectiveConfig)) {
+            if (CloakController.isSupported(effectiveConfig)) {
                 val started = runCatching { CloakController.start(context, effectiveConfig) }.getOrDefault(false)
                 if (started && CloakController.isRunning()) {
                     effectiveConfig = effectiveConfig.copy(peer = CloakController.getEffectivePeer(effectiveConfig))
@@ -184,14 +166,13 @@ if (!canReachGatewayOrInternet()) {
                     if (!isUserInitiatedStop) {
                         if (s == ConnectionStatus.ERROR || s == ConnectionStatus.FAILED) {
                             if (_status.value == ConnectionStatus.RUNNING && effectiveConfig.smartReconnect) {
-                                LogRepository.w("[Controller] Runner reported $s during active session. Holding network and starting auto-reconnect...", "Watchdog")
+                                LogRepository.w("[Controller] Sing-box reported $s during active session. Starting auto-reconnect...", "Watchdog")
                                 triggerPersistentReconnect(effectiveConfig, coreSocksPort, actualHttpPort)
                                 return@collect
                             }
                         }
                         if (_status.value != ConnectionStatus.STOPPED && s != ConnectionStatus.STOPPED) {
                             if (s == ConnectionStatus.RUNNING || s == ConnectionStatus.SOCKS_READY || s == ConnectionStatus.DATAPLANE_VALIDATED) {
-                                // Only promote to RUNNING directly if no secondary ExitNode is pending
                                 if (!needsExitNode || activeTargetPort != coreSocksPort) {
                                     _status.value = ConnectionStatus.RUNNING
                                 }
@@ -203,53 +184,37 @@ if (!canReachGatewayOrInternet()) {
                 }
             }
 
-            val maxGoolRerolls = if (effectiveConfig.protocol == AetherProtocol.GOOL && effectiveConfig.goolNeighborEgress) 3 else 1
+            val workDir = File(getSystemUtils(context).getFilesDir()).apply { mkdirs() }
+            runCatching { File(workDir, "config-runtime.json").delete() }
+
+            runner.start(
+                config = effectiveConfig.copy(httpProxyEnabled = true, httpPort = actualHttpPort.toString()),
+                bindAddress = "127.0.0.1:$coreSocksPort",
+                onCodeRequired = { _isWaitingForCode.value = true },
+                inputProvider = { loginCodeChannel.receive() }
+            )
+
             var coreReady = false
-
-            for (reroll in 1..maxGoolRerolls) {
-                if (reroll > 1) {
-                    LogRepository.i("[GOOL] Exit country was not a neighboring region; re-rolling endpoint ($reroll/$maxGoolRerolls)...", "GOOL")
-                    runner.stop()
-                    delay(600.milliseconds)
-                    _status.value = ConnectionStatus.STARTING
+            for (i in 0..100) {
+                currentCoroutineContext().ensureActive()
+                val currentRunnerStatus = runner.connectionStatus.value
+                val portOpen = probePort("127.0.0.1", coreSocksPort)
+                if (currentRunnerStatus == ConnectionStatus.RUNNING ||
+                    currentRunnerStatus == ConnectionStatus.DATAPLANE_VALIDATED ||
+                    currentRunnerStatus == ConnectionStatus.SOCKS_READY ||
+                    (i > 15 && portOpen)
+                ) {
+                    coreReady = true
+                    break
                 }
-
-                runner.start(
-                    config = effectiveConfig.copy(httpProxyEnabled = true, httpPort = actualHttpPort.toString()),
-                    bindAddress = "127.0.0.1:$coreSocksPort",
-                    onCodeRequired = { _isWaitingForCode.value = true },
-                    inputProvider = { loginCodeChannel.receive() }
-                )
-
-                coreReady = false
-                val maxWaitLoops = if (effectiveConfig.protocol == AetherProtocol.GOOL) 150 else 120
-                for (i in 0..maxWaitLoops) {
-                    currentCoroutineContext().ensureActive()
-                    val currentRunnerStatus = runner.connectionStatus.value
-                    val portOpen = probePort("127.0.0.1", coreSocksPort)
-                    if (currentRunnerStatus == ConnectionStatus.RUNNING ||
-                        currentRunnerStatus == ConnectionStatus.DATAPLANE_VALIDATED ||
-                        currentRunnerStatus == ConnectionStatus.SOCKS_READY ||
-                        (i > 35 && portOpen)
-                    ) {
-                        coreReady = true
-                        break
-                    }
-                    if (i > 10 && currentRunnerStatus == ConnectionStatus.ERROR) {
-                        break
-                    }
-                    delay(300.milliseconds)
+                if (i > 10 && currentRunnerStatus == ConnectionStatus.ERROR) {
+                    break
                 }
-
-                if (!coreReady) break
-
-                // Do not kill validated GOOL connections when Cloudflare WARP tags its FRA/GYD egress pool as IR
-                break
-                break
+                delay(250.milliseconds)
             }
 
             if (!coreReady) {
-                LogRepository.e("[Controller] Core connection timed out")
+                LogRepository.e("[Controller] Sing-box core connection timed out")
                 doStop()
                 _status.value = ConnectionStatus.ERROR
                 return
@@ -261,7 +226,7 @@ if (!canReachGatewayOrInternet()) {
             if (effectiveConfig.exitNodeMode == ExitNodeMode.PSIPHON_POOL && PsiphonController.isSupported(effectiveConfig)) {
                 _status.value = ConnectionStatus.VALIDATING
                 val upstreamUrl = "http://127.0.0.1:$actualHttpPort"
-                LogRepository.i("[Controller] Chaining Psiphon over HTTP proxy $upstreamUrl", "Psiphon")
+                LogRepository.i("[Controller] Chaining Psiphon over Sing-box HTTP proxy $upstreamUrl", "Psiphon")
 
                 val psiphonStarted = PsiphonController.start(
                     context = context,
@@ -305,12 +270,10 @@ if (!canReachGatewayOrInternet()) {
                     val binaryPath = runCatching {
                         io.github.immaghzbad.aetherst.shared.core.getBinaryManager(context).prepareBinary("sing-box")
                     }.getOrNull()
-                    val workDir = getSystemUtils(context).getFilesDir()
-                    java.io.File(workDir).mkdirs()
                     val tunnel = io.github.immaghzbad.aetherst.shared.net.WireGuardExitTunnel(
                         config = targetWgCfg,
                         binaryPath = binaryPath,
-                        workingDir = workDir,
+                        workingDir = workDir.absolutePath,
                         primarySocksHost = "127.0.0.1",
                         primarySocksPort = coreSocksPort,
                         localListenPort = 10805
@@ -318,11 +281,11 @@ if (!canReachGatewayOrInternet()) {
                     val started = runCatching { tunnel.start() }.getOrDefault(false)
                     if (started) {
                         wgExitTunnel = tunnel
-                        effectiveTargetPort = 10805
-                        ActiveProxyProvider.customWgPort = 10805
-                        LogRepository.i("[Controller] Custom WireGuard Exit ready on port 10805 (Exit IP: ${tunnel.verifiedExitIp ?: "Active"})", "WireGuard")
+                        effectiveTargetPort = tunnel.activePort()
+                        ActiveProxyProvider.customWgPort = effectiveTargetPort
+                        LogRepository.i("[Controller] Sing-box WireGuard Exit ready on port $effectiveTargetPort (Exit IP: ${tunnel.verifiedExitIp ?: "Active"})", "WireGuard")
                     } else {
-                        val err = tunnel.lastErrorMessage ?: "Proton WireGuard handshake or data-plane verification failed"
+                        val err = tunnel.lastErrorMessage ?: "Sing-box Proton WireGuard detour handshake failed"
                         throw IllegalStateException(err)
                     }
                 } else {
@@ -352,13 +315,11 @@ if (!canReachGatewayOrInternet()) {
                 val binaryPath = runCatching {
                     io.github.immaghzbad.aetherst.shared.core.getBinaryManager(context).prepareBinary("sing-box")
                 }.getOrNull()
-                val workDir = getSystemUtils(context).getFilesDir()
-                java.io.File(workDir).mkdirs()
                 val tunnel = io.github.immaghzbad.aetherst.shared.net.FirefoxVpnExitTunnel(
                     token = effectiveConfig.firefoxVpnToken,
                     country = effectiveConfig.firefoxVpnCountry,
                     binaryPath = binaryPath,
-                    workingDir = workDir,
+                    workingDir = workDir.absolutePath,
                     primarySocksHost = "127.0.0.1",
                     primarySocksPort = coreSocksPort,
                     localListenPort = effectiveConfig.firefoxVpnPort
@@ -368,9 +329,9 @@ if (!canReachGatewayOrInternet()) {
                     firefoxVpnTunnel = tunnel
                     effectiveTargetPort = effectiveConfig.firefoxVpnPort
                     ActiveProxyProvider.firefoxVpnPort = effectiveConfig.firefoxVpnPort
-                    LogRepository.i("[Controller] Firefox VPN Exit ready on port ${effectiveConfig.firefoxVpnPort} (Exit IP: ${tunnel.verifiedExitIp ?: "Active"})", "FirefoxVpn")
+                    LogRepository.i("[Controller] Sing-box Firefox VPN Exit ready on port ${effectiveConfig.firefoxVpnPort} (Exit IP: ${tunnel.verifiedExitIp ?: "Active"})", "FirefoxVpn")
                 } else {
-                    val err = tunnel.lastErrorMessage ?: "Firefox VPN authentication or data-plane failed"
+                    val err = tunnel.lastErrorMessage ?: "Firefox VPN authentication or Sing-box outbound failed"
                     throw IllegalStateException(err)
                 }
             }
@@ -379,7 +340,13 @@ if (!canReachGatewayOrInternet()) {
             activeTargetPort = effectiveTargetPort
 
             if (effectiveConfig.connectionMode == ConnectionMode.TUNNEL) {
-                startTunnelMode(effectiveConfig, effectiveTargetPort)
+                // Only start external TunHelper if Sing-box fell back to config-runtime.json without its built-in tun inbound
+                val singBoxOwnsTun = !File(workDir, "config-runtime.json").exists()
+                if (singBoxOwnsTun) {
+                    LogRepository.i("[Controller] Sing-box native TUN inbound (auto_route=true, strict_route=true) is managing system routing.")
+                } else {
+                    startTunnelMode(effectiveConfig, effectiveTargetPort)
+                }
             } else if (effectiveConfig.connectionMode == ConnectionMode.SYSTEM_PROXY) {
                 when (effectiveConfig.exitNodeMode) {
                     ExitNodeMode.DIRECT -> {
@@ -390,7 +357,7 @@ if (!canReachGatewayOrInternet()) {
                         getSystemUtils(context).setSystemProxy("127.0.0.1", httpPort = psiphonHttpPort, socksPort = effectiveTargetPort)
                     }
                     ExitNodeMode.CUSTOM_WG -> {
-                        getSystemUtils(context).setSystemProxy("127.0.0.1", httpPort = 10804, socksPort = 10805)
+                        getSystemUtils(context).setSystemProxy("127.0.0.1", httpPort = actualHttpPort, socksPort = effectiveTargetPort)
                     }
                     ExitNodeMode.FIREFOX_VPN -> {
                         getSystemUtils(context).setSystemProxy("127.0.0.1", httpPort = effectiveTargetPort - 1, socksPort = effectiveTargetPort)
@@ -404,11 +371,9 @@ if (!canReachGatewayOrInternet()) {
             _status.value = ConnectionStatus.RUNNING
             startTimer()
             startWatchdog(effectiveConfig, coreSocksPort, actualHttpPort)
-            if (effectiveConfig.exitNodeMode != ExitNodeMode.DIRECT) {
-                scope.launch {
-                    delay(400.milliseconds)
-                    IpInfoRepository.fetchIpInfo("127.0.0.1", effectiveTargetPort, useProxy = true, provider = effectiveConfig.ipInfoProvider)
-                }
+            scope.launch {
+                delay(400.milliseconds)
+                IpInfoRepository.fetchIpInfo("127.0.0.1", effectiveTargetPort, useProxy = true, provider = effectiveConfig.ipInfoProvider)
             }
         }
 
@@ -422,10 +387,9 @@ if (!canReachGatewayOrInternet()) {
                         val portOk = probePort("127.0.0.1", coreSocksPort)
                         if (!portOk) {
                             consecutiveFailures++
-                            LogRepository.w("[Controller] Core port $coreSocksPort probe failed ($consecutiveFailures/3)", "Watchdog")
+                            LogRepository.w("[Controller] Sing-box port $coreSocksPort probe failed ($consecutiveFailures/3)", "Watchdog")
                             if (consecutiveFailures >= 3) {
                                 if (effectiveConfig.smartReconnect && !isUserInitiatedStop) {
-                                    LogRepository.w("[Controller] Core port $coreSocksPort probe failed 3 consecutive times. Holding TUN interface...", "Watchdog")
                                     triggerPersistentReconnect(effectiveConfig, coreSocksPort, actualHttpPort)
                                 }
                             }
@@ -442,14 +406,13 @@ if (!canReachGatewayOrInternet()) {
         private fun triggerPersistentReconnect(effectiveConfig: AetherConfig, coreSocksPort: Int, actualHttpPort: Int) {
             if (reconnectJob?.isActive == true || isUserInitiatedStop) return
             _status.value = ConnectionStatus.RECONNECTING
-            LogRepository.i("[Controller] State -> RECONNECTING. Keeping Wintun interface & routes intact to prevent app disconnects.", "Watchdog")
 
             reconnectJob = scope.launch {
                 var attempt = 0
                 val maxAttempts = effectiveConfig.reconnectRetryLimit.coerceIn(5, 60)
                 while (isActive && !isUserInitiatedStop && attempt < maxAttempts) {
                     attempt++
-                    LogRepository.i("[Controller] Hold & Reconnect attempt $attempt of $maxAttempts...", "Watchdog")
+                    LogRepository.i("[Controller] Sing-box Reconnect attempt $attempt of $maxAttempts...", "Watchdog")
 
                     try { wgExitTunnel?.stop() } catch (_: Throwable) {}
                     wgExitTunnel = null
@@ -462,9 +425,7 @@ if (!canReachGatewayOrInternet()) {
 
                     if (isUserInitiatedStop) break
 
-                    val hasPhysicalRoute = canReachGatewayOrInternet()
-                    if (!hasPhysicalRoute) {
-                        LogRepository.i("[Controller] Physical internet / mobile hotspot link unavailable. Holding...", "Watchdog")
+                    if (!canReachGatewayOrInternet()) {
                         delay(2500.milliseconds)
                         continue
                     }
@@ -484,82 +445,17 @@ if (!canReachGatewayOrInternet()) {
                             if (rStatus == ConnectionStatus.RUNNING ||
                                 rStatus == ConnectionStatus.DATAPLANE_VALIDATED ||
                                 rStatus == ConnectionStatus.SOCKS_READY ||
-                                (w > 20 && probePort("127.0.0.1", coreSocksPort))
+                                (w > 15 && probePort("127.0.0.1", coreSocksPort))
                             ) {
                                 ready = true
                                 break
                             }
-                            delay(500.milliseconds)
+                            delay(400.milliseconds)
                         }
 
                         if (ready) {
-                            if (effectiveConfig.exitNodeMode == ExitNodeMode.CUSTOM_WG) {
-                                val targetWgCfg = if (effectiveConfig.customWgAutoSelect && effectiveConfig.customWgProfiles.isNotEmpty()) {
-                                    io.github.immaghzbad.aetherst.shared.net.WireGuardExitTunnel.selectFastestProfile(
-                                        effectiveConfig.customWgProfiles,
-                                        effectiveConfig.customWgConfig
-                                    )
-                                } else {
-                                    effectiveConfig.customWgConfig
-                                }
-                                if (targetWgCfg.isValid()) {
-                                    val binaryPath = runCatching {
-                                        io.github.immaghzbad.aetherst.shared.core.getBinaryManager(context).prepareBinary("sing-box")
-                                    }.getOrNull()
-                                    val workDir = getSystemUtils(context).getFilesDir()
-                                    java.io.File(workDir).mkdirs()
-                                    val tunnel = io.github.immaghzbad.aetherst.shared.net.WireGuardExitTunnel(
-                                        config = targetWgCfg,
-                                        binaryPath = binaryPath,
-                                        workingDir = workDir,
-                                        primarySocksHost = "127.0.0.1",
-                                        primarySocksPort = coreSocksPort,
-                                        localListenPort = 10805
-                                    )
-                                    if (!tunnel.start()) {
-                                        throw IllegalStateException(tunnel.lastErrorMessage ?: "Layer-2 WireGuard failed to reconnect")
-                                    }
-                                    wgExitTunnel = tunnel
-                                    ActiveProxyProvider.customWgPort = 10805
-                                }
-                            } else if (effectiveConfig.exitNodeMode == ExitNodeMode.CUSTOM_SOCKS5) {
-                                val relay = io.github.immaghzbad.aetherst.shared.net.CustomSocks5Relay(
-                                    listenPort = 10806,
-                                    primarySocksHost = "127.0.0.1",
-                                    primarySocksPort = coreSocksPort,
-                                    remoteHost = effectiveConfig.customSocks5Host.trim(),
-                                    remotePort = effectiveConfig.customSocks5Port,
-                                    username = effectiveConfig.customSocks5Username,
-                                    password = effectiveConfig.customSocks5Password
-                                )
-                                if (!relay.start()) {
-                                    throw IllegalStateException("Custom SOCKS5 relay failed to reconnect")
-                                }
-                                customSocksRelay = relay
-                            } else if (effectiveConfig.exitNodeMode == ExitNodeMode.FIREFOX_VPN) {
-                                val binaryPath = runCatching {
-                                    io.github.immaghzbad.aetherst.shared.core.getBinaryManager(context).prepareBinary("sing-box")
-                                }.getOrNull()
-                                val workDir = getSystemUtils(context).getFilesDir()
-                                java.io.File(workDir).mkdirs()
-                                val tunnel = io.github.immaghzbad.aetherst.shared.net.FirefoxVpnExitTunnel(
-                                    token = effectiveConfig.firefoxVpnToken,
-                                    country = effectiveConfig.firefoxVpnCountry,
-                                    binaryPath = binaryPath,
-                                    workingDir = workDir,
-                                    primarySocksHost = "127.0.0.1",
-                                    primarySocksPort = coreSocksPort,
-                                    localListenPort = effectiveConfig.firefoxVpnPort
-                                )
-                                if (!tunnel.start()) {
-                                    throw IllegalStateException(tunnel.lastErrorMessage ?: "Firefox VPN failed to reconnect")
-                                }
-                                firefoxVpnTunnel = tunnel
-                                ActiveProxyProvider.firefoxVpnPort = effectiveConfig.firefoxVpnPort
-                            }
-
                             _status.value = ConnectionStatus.RUNNING
-                            LogRepository.i("[Controller] Resilient reconnect SUCCESSFUL! Session restored without dropping application sockets.", "Watchdog")
+                            LogRepository.i("[Controller] Sing-box reconnect SUCCESSFUL!", "Watchdog")
                             return@launch
                         }
                     } catch (e: Exception) {
@@ -570,7 +466,6 @@ if (!canReachGatewayOrInternet()) {
                 }
 
                 if (!isUserInitiatedStop && _status.value == ConnectionStatus.RECONNECTING) {
-                    LogRepository.e("[Controller] Persistent reconnect exhausted after $maxAttempts attempts.", "Watchdog")
                     _status.value = ConnectionStatus.ERROR
                     doStop()
                 }
@@ -618,7 +513,7 @@ if (!canReachGatewayOrInternet()) {
                 directIps = directIps,
                 udpMode = udpMode
             )
-            LogRepository.i("[Controller] TUN helper started on port $targetPort, mtu=$effectiveMtu, bypass=${config.excludedPackages.size}, blocked=${config.blockedPackages.size}, directRoutes=${directIps.size}")
+            LogRepository.i("[Controller] TUN helper started on port $targetPort, mtu=$effectiveMtu")
         }
 
         fun stop() {
@@ -642,7 +537,7 @@ if (!canReachGatewayOrInternet()) {
         }
 
         private fun doStop() {
-            LogRepository.i("[Controller] Stopping all components")
+            LogRepository.i("[Controller] Stopping all Sing-box components")
             watchdogJob?.cancel()
             watchdogJob = null
             reconnectJob?.cancel()
@@ -703,13 +598,13 @@ if (!canReachGatewayOrInternet()) {
 
         private fun getWintunBytes(): Pair<Long, Long> {
             return try {
-                val proc = ProcessBuilder("netsh", "interface", "ipv4", "show", "subinterfaces", "AetherST")
+                val proc = ProcessBuilder("netsh", "interface", "ipv4", "show", "subinterfaces", "aether-tun0")
                     .redirectErrorStream(true).start()
                 val lines = proc.inputStream.bufferedReader().readLines()
                 var rx = 0L
                 var tx = 0L
                 for (line in lines) {
-                    if (line.contains("AetherST", ignoreCase = true)) {
+                    if (line.contains("aether-tun0", ignoreCase = true) || line.contains("AetherST", ignoreCase = true)) {
                         val toks = line.trim().split(Regex("\\s+"))
                         if (toks.size >= 5) {
                             rx = toks[2].toLongOrNull() ?: 0L

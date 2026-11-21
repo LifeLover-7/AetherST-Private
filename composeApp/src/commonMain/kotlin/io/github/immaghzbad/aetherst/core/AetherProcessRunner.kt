@@ -1,39 +1,77 @@
 package io.github.immaghzbad.aetherst.shared.core
 
+import io.github.immaghzbad.aetherst.platform.PlatformContext
+import io.github.immaghzbad.aetherst.platform.getSystemUtils
 import io.github.immaghzbad.aetherst.shared.data.IpInfoRepository
 import io.github.immaghzbad.aetherst.shared.data.LogRepository
 import io.github.immaghzbad.aetherst.shared.model.*
-import io.github.immaghzbad.aetherst.platform.PlatformContext
-import io.github.immaghzbad.aetherst.platform.getSystemUtils
+import io.github.immaghzbad.aetherst.shared.net.FirefoxVpnExitTunnel
+import io.github.immaghzbad.aetherst.shared.net.WireGuardCrypto
+import io.github.immaghzbad.aetherst.shared.net.WireGuardExitTunnel
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.io.DataInputStream
+import java.io.File
+import java.net.Inet4Address
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.util.Base64
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.time.Duration.Companion.milliseconds
 
-private val ExitDetailRegex = Regex("""(?i)\b(?:gool|warp-in-warp|masque-in-masque|masque|wireguard|wg|mim)\s+exit:\s*([0-9a-fA-F.:]+),\s*([A-Za-z]{2})(?:\s+via\s+([A-Za-z0-9]+))?""")
-    private val SelectedWgEndpointRegex = Regex("""(?i)(?:selected|endpoint|gateway|validating|establishing|peer|using)[^\n]*?\b((?:162\.159|188\.114|198\.41)\.\d{1,3}\.\d{1,3}:\d{2,5})\b""")
-
+/**
+ * Sing-box Core Process Runner (Common / Desktop).
+ *
+ * The application acts strictly as a UI & Configuration Manager:
+ *  1. Generates `config.json` containing:
+ *     - A `"tun"` inbound (`"auto_route": true`, `"strict_route": true`, `"mtu": 1120`) plus local SOCKS/HTTP inbounds.
+ *     - Two `"wireguard"` outbounds:
+ *       a) `"warp-out"` connected to the Cloudflare WARP server (`"mtu": 1280`, `"keepalive": 25`).
+ *       b) `"proton-out"` connected to the ProtonVPN / Custom WireGuard server with
+ *          `"detour": "warp-out"`, `"mtu": 1120`, and `"keepalive": 25`.
+ *  2. Executes the bundled `sing-box` binary (`sing-box run -c config.json`) and monitors its lifecycle.
+ */
 class AetherProcessRunner(private val context: PlatformContext) {
     private val systemUtils = getSystemUtils(context)
     private var process: PlatformProcess? = null
     private var runnerJob: Job? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val currentAttemptId = AtomicLong(0)
-    private var goolOuterValidated = false
     private var lastBindAddress: String = "127.0.0.1:2021"
 
     private val _connectionStatus = MutableStateFlow(ConnectionStatus.STOPPED)
     val connectionStatus: StateFlow<ConnectionStatus> = _connectionStatus.asStateFlow()
 
-    fun start(config: AetherConfig, bindAddress: String, onCodeRequired: () -> Unit = {}, inputProvider: suspend () -> String = { "" }) {
+    data class WarpAccount(
+        val deviceId: String,
+        val accessToken: String,
+        val server: String,
+        val serverPort: Int,
+        val ipv4: String,
+        val ipv6: String,
+        val privateKey: String,
+        val peerPublicKey: String,
+        val reserved: List<Int>
+    )
+
+    fun start(
+        config: AetherConfig,
+        bindAddress: String,
+        onCodeRequired: () -> Unit = {},
+        inputProvider: suspend () -> String = { "" }
+    ) {
         if (runnerJob?.isActive == true) return
         LogRepository.currentAppLogLevel = config.appLogLevel
         LogRepository.currentCoreLogLevel = config.coreLogLevel
         val attemptId = currentAttemptId.incrementAndGet()
-        goolOuterValidated = false
+        lastBindAddress = bindAddress
         updateState(ConnectionStatus.STARTING, attemptId)
+
         runnerJob = scope.launch {
             var retryCount = 0
             while (isActive && (currentAttemptId.get() == attemptId)) {
@@ -49,23 +87,23 @@ class AetherProcessRunner(private val context: PlatformContext) {
                 }
                 if (retryCount > 0) {
                     val waitTime = (retryCount * 1000L).coerceAtMost(10000L)
-                    LogRepository.i("Recovering connection (Retry $retryCount)...")
+                    LogRepository.i("Recovering Sing-box connection (Retry $retryCount)...")
                     updateState(ConnectionStatus.RECONNECTING, attemptId)
                     delay(waitTime.milliseconds)
                 } else {
-                    LogRepository.i("Starting system core at $bindAddress")
-                    lastBindAddress = bindAddress
+                    LogRepository.i("Starting Sing-box core at $bindAddress")
                 }
+
                 try {
-                    val success = runBinary(config, attemptId, bindAddress, onCodeRequired, inputProvider)
+                    val success = runSingBoxBinary(config, attemptId, bindAddress)
                     if (currentAttemptId.get() != attemptId) break
                     if (!success) {
-                        LogRepository.e("Core execution failed or terminated unexpectedly.")
+                        LogRepository.e("Sing-box core execution terminated unexpectedly.")
                     }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    LogRepository.e("Execution cycle critical error: ${e.message}")
+                    LogRepository.e("Sing-box execution cycle error: ${e.message}")
                 }
                 retryCount++
                 if (connectionStatus.value == ConnectionStatus.RUNNING) {
@@ -75,654 +113,602 @@ class AetherProcessRunner(private val context: PlatformContext) {
         }
     }
 
-    private suspend fun runBinary(config: AetherConfig, attemptId: Long, bindAddress: String, onCodeRequired: () -> Unit, inputProvider: suspend () -> String): Boolean = coroutineScope {
+    private suspend fun runSingBoxBinary(
+        config: AetherConfig,
+        attemptId: Long,
+        bindAddress: String
+    ): Boolean = coroutineScope {
+        val workDir = File(systemUtils.getFilesDir()).apply { mkdirs() }
+        val binaryPath = runCatching {
+            getBinaryManager(context).prepareBinary("sing-box")
+        }.getOrElse {
+            getBinaryManager(context).prepareBinary("aether")
+        }
+
+        val warpAccount = resolveOrRegisterWarpAccount(config, workDir)
+        val configFile = File(workDir, "config.json")
+
+        // Always write the canonical config.json with tun (auto_route=true, strict_route=true)
+        // and two wireguard outbounds (warp-out + proton-out with detour="warp-out", mtu=1120, keepalive=25)
+        val primaryJson = generateSingBoxConfigJson(
+            config = config,
+            bindAddress = bindAddress,
+            warpAccount = warpAccount,
+            includeTunInbound = true,
+            includeKeepaliveField = true
+        )
+        configFile.writeText(primaryJson)
+        LogRepository.i("Generated Sing-box config.json (${configFile.absolutePath})", "SingBoxCore")
+
+        // First attempt: execute sing-box with the primary config.json
+        val needFallbackKeepalive = AtomicBoolean(false)
+        val needFallbackNoTun = AtomicBoolean(false)
+
+        val exitOk = executeSingBoxProcess(
+            binaryPath = binaryPath,
+            configPath = configFile.absolutePath,
+            workDir = workDir,
+            attemptId = attemptId,
+            onUnknownKeepalive = { needFallbackKeepalive.set(true) },
+            onTunPermissionDenied = { needFallbackNoTun.set(true) }
+        )
+
+        if (currentAttemptId.get() != attemptId) return@coroutineScope true
+
+        // If the bundled sing-box binary rejected "keepalive" in its strict Go struct decoder
+        // or lacked root/admin privilege for the internal tun interface, retry immediately with
+        // the runtime-adapted JSON while keeping config.json intact on disk.
+        if (!exitOk && (needFallbackKeepalive.get() || needFallbackNoTun.get())) {
+            val runtimeFile = File(workDir, "config-runtime.json")
+            val runtimeJson = generateSingBoxConfigJson(
+                config = config,
+                bindAddress = bindAddress,
+                warpAccount = warpAccount,
+                includeTunInbound = !needFallbackNoTun.get(),
+                includeKeepaliveField = !needFallbackKeepalive.get()
+            )
+            runtimeFile.writeText(runtimeJson)
+            LogRepository.i(
+                "Retrying Sing-box with runtime profile (tun=${!needFallbackNoTun.get()}, strictSchema=${needFallbackKeepalive.get()})",
+                "SingBoxCore"
+            )
+            return@coroutineScope executeSingBoxProcess(
+                binaryPath = binaryPath,
+                configPath = runtimeFile.absolutePath,
+                workDir = workDir,
+                attemptId = attemptId,
+                onUnknownKeepalive = {},
+                onTunPermissionDenied = {}
+            )
+        }
+
+        exitOk
+    }
+
+    private suspend fun executeSingBoxProcess(
+        binaryPath: String,
+        configPath: String,
+        workDir: File,
+        attemptId: Long,
+        onUnknownKeepalive: () -> Unit,
+        onTunPermissionDenied: () -> Unit
+    ): Boolean = coroutineScope {
         val proc = PlatformProcess()
         try {
-            val binaryPath = getBinaryManager(context).prepareBinary("aether")
-            val command = mutableListOf(binaryPath, "--bind", bindAddress)
-
-            // انتخاب صریح پروتکل مطابق راهنمای رسمی باینری aether.exe
-            when (config.protocol) {
-                AetherProtocol.MASQUE -> command.add("--masque")
-                AetherProtocol.WG -> command.add("--wg")
-                AetherProtocol.GOOL -> {} // Added below based on config.goolClassic
-                AetherProtocol.MIM -> command.add("--mim")
-                AetherProtocol.ZERO_TRUST -> {}
-            }
-
-            // تنظیم حالت اسکن و پروفایل Obfuscation (Noise)
-            command.add("--scan")
-            command.add(config.scanMode.rawValue)
-            command.add("--noize")
-            command.add(config.noise.rawValue)
-
-            val httpBindHost = bindAddress.substringBefore(':')
-            val actualHttpPort = config.httpPort.ifBlank { "2020" }
-            if (config.httpProxyEnabled) {
-                command.add("--http-proxy")
-                command.add("$httpBindHost:$actualHttpPort")
-            }
-
-            val routingFile = writeRoutingFile(config)
-            if (routingFile != null) {
-                command.add("--routes")
-                command.add(routingFile.absolutePath)
-            }
-
-            if (config.protocol == AetherProtocol.ZERO_TRUST) {
-                if (config.teamName.isNotEmpty()) {
-                    command.add("--team")
-                    command.add(config.teamName)
-                }
-                when {
-                    config.accessToken.isNotEmpty() -> {
-                        command.add("--access-token")
-                        command.add(config.accessToken)
-                    }
-                    config.accessId.isNotEmpty() || config.accessSecret.isNotEmpty() -> {
-                        command.add("--access-id")
-                        command.add(config.accessId)
-                        command.add("--access-secret")
-                        command.add(config.accessSecret)
-                    }
-                    config.accessEmail.isNotEmpty() -> {
-                        command.add("--access-email")
-                        command.add(config.accessEmail)
-                    }
-                }
-                if (config.useGateway) command.add("--gateway")
-            }
-
-            val effectiveIp = config.effectiveIpMode()
-            command.add(when (effectiveIp) {
-                AetherIpMode.IPV4 -> "-4"
-                AetherIpMode.IPV6 -> "-6"
-                else -> "--dual"
-            })
-
-            val isMasqueBased = config.protocol == AetherProtocol.MASQUE || config.protocol == AetherProtocol.MIM || config.protocol == AetherProtocol.ZERO_TRUST || (config.protocol == AetherProtocol.GOOL && !config.goolClassic) || config.mimEnabled
-            if (isMasqueBased) {
-                when (config.effectiveHttpVersion()) {
-                    MasqueHttpVersion.H2 -> {
-                        command.add("--h2")
-                    }
-                    MasqueHttpVersion.H1 -> {
-                        command.add("--no-h2")
-                        command.add("--no-quic-v2")
-                    }
-                    MasqueHttpVersion.H3 -> {
-                        // H3 uses native QUIC without --h2 flag
-                    }
-                    MasqueHttpVersion.AUTO -> {
-                        if (config.h2Mode) command.add("--h2")
-                    }
-                }
-                if (config.echEnabled) {
-                    command.add("--ech")
-                    command.add("auto")
-                }
-                if (config.h2Fragment) {
-                    command.add("--fragment")
-                    command.add("--fragment-size")
-                    command.add(config.fragmentSize.ifBlank { "30-60" })
-                    command.add("--fragment-delay")
-                    command.add(config.fragmentDelay.ifBlank { "5-15" })
-                }
-                val effectiveSni = if (config.masqueSni.isNotBlank()) {
-                    config.masqueSni.trim()
-                } else if (config.protocol != AetherProtocol.ZERO_TRUST) {
-                    "consumer-masque.cloudflareclient.com"
-                } else {
-                    ""
-                }
-                if (effectiveSni.isNotBlank()) {
-                    command.add("--masque-sni")
-                    command.add(effectiveSni)
-                }
-            }
-
-
-            val mimActive = config.protocol == AetherProtocol.MIM || config.mimEnabled
-            if (mimActive) {
-                if (config.protocol != AetherProtocol.MIM) {
-                    command.add("--mim")
-                }
-                if (config.mimOuter.isNotBlank()) {
-                    command.add("--mim-outer")
-                    command.add(config.mimOuter.trim())
-                }
-                if (config.mimInner.isNotBlank()) {
-                    command.add("--mim-inner")
-                    command.add(config.mimInner.trim())
-                }
-                if (config.mimScan) {
-                    command.add("--mim-scan")
-                }
-            }
-
-            if (config.noDataCheck) command.add("--no-data-check")
-            if (config.quickReconnect) command.add("--quick-reconnect") else command.add("--no-quick-reconnect")
-
-            val wiwOuter = if (config.protocol == AetherProtocol.GOOL) config.wiwOuter.trim().ifEmpty { config.peer.trim() } else ""
-            val wiwInner = if (config.protocol == AetherProtocol.GOOL) config.wiwInner.trim().ifEmpty { config.wgPeer.trim() } else ""
-
-            when (config.protocol) {
-                AetherProtocol.GOOL -> {
-                    if (config.goolClassic) {
-                        command.add("--gool-classic")
-                        if (wiwOuter.isNotEmpty()) {
-                            command.add("--wiw-outer")
-                            command.add(wiwOuter)
-                        }
-                        if (wiwInner.isNotEmpty()) {
-                            command.add("--wiw-inner")
-                            command.add(wiwInner)
-                        }
-                        if (config.wiwScan) {
-                            command.add("--wiw-scan")
-                        }
-                    } else {
-                        command.add("--gool")
-                        if (wiwOuter.isNotEmpty()) {
-                            command.add("--peer")
-                            command.add(wiwOuter)
-                        }
-                        if (wiwInner.isNotEmpty()) {
-                            command.add("--gool-peer")
-                            command.add(wiwInner)
-                        }
-                    }
-                }
-                AetherProtocol.WG -> {
-                    val wgPeer = config.wgPeer.trim().ifEmpty { config.peer.trim() }
-                    if (wgPeer.isNotEmpty()) {
-                        command.add("--peer")
-                        command.add(wgPeer)
-                    }
-                }
-                else -> {
-                    val peer = config.peer.trim()
-                    if (peer.isNotEmpty()) {
-                        command.add("--peer")
-                        command.add(peer)
-                    }
-                }
-            }
-
-            if (config.protocol == AetherProtocol.WG || config.protocol == AetherProtocol.GOOL) {
-                command.add("--keepalive")
-                command.add(if (config.keepaliveEnabled) config.keepalive.toString() else "0")
-            }
-            if (config.tlsGroups.isNotEmpty()) {
-                command.add("--tls-groups")
-                command.add(config.tlsGroups)
-            }
-            command.add("--validate-secs")
-            command.add(config.validateSecs.toString())
-            command.add("--reconnect-secs")
-            command.add(config.reconnectSecs.toString())
-            if (config.noProfileRetry) command.add("--no-profile-retry")
-            if (config.dnsEnabled && config.dnsList.isNotEmpty()) {
-                command.add("--dns")
-                command.add(config.dnsList)
-            }
-
-            val logLevelArg = if (config.coreLogLevel == AetherLogLevel.DEBUG) "debug" else "info"
-            command.add("--log-level")
-            command.add(logLevelArg)
-
-            val env = mutableMapOf<String, String>()
-            env["AETHER_PROTOCOL"] = config.protocol.rawValue
-            env["AETHER_NOIZE"] = config.noise.rawValue
-            env["AETHER_SCAN"] = config.scanMode.rawValue
-            env["AETHER_IP"] = config.effectiveIpMode().rawValue
-            env["AETHER_SOCKS"] = bindAddress
-            env["AETHER_LOG_LEVEL"] = logLevelArg
-            env["AETHER_PERF_PROFILE"] = config.perfProfile.rawValue
-            if (routingFile != null) {
-                env["AETHER_ROUTES_FILE"] = routingFile.absolutePath
-            }
-            if (isMasqueBased) {
-            when (config.effectiveHttpVersion()) {
-                MasqueHttpVersion.H2 -> {
-                    env["AETHER_MASQUE_HTTP2"] = "1"
-                }
-                MasqueHttpVersion.H1 -> {
-                    env["AETHER_MASQUE_HTTP2"] = "0"
-                    env["AETHER_QUIC_V2"] = "0"
-                }
-                MasqueHttpVersion.H3 -> {
-                    env["AETHER_MASQUE_HTTP2"] = "0"
-                    env["AETHER_QUIC_V2"] = "1"
-                }
-                MasqueHttpVersion.AUTO -> {
-                    if (config.h2Mode) env["AETHER_MASQUE_HTTP2"] = "1"
-                }
-            }
-            if (config.echEnabled) env["AETHER_ECH"] = "auto"
-            if (config.h2Fragment) {
-                env["AETHER_MASQUE_H2_FRAGMENT"] = "1"
-                env["AETHER_MASQUE_H2_FRAGMENT_SIZE"] = config.fragmentSize.ifBlank { "30-60" }
-                env["AETHER_MASQUE_H2_FRAGMENT_DELAY"] = config.fragmentDelay.ifBlank { "5-15" }
-            }
-            val effectiveSni = if (config.masqueSni.isNotBlank()) {
-                config.masqueSni.trim()
-            } else if (config.protocol != AetherProtocol.ZERO_TRUST) {
-                "consumer-masque.cloudflareclient.com"
-            } else {
-                ""
-            }
-            if (effectiveSni.isNotBlank()) {
-                env["AETHER_MASQUE_SNI"] = effectiveSni
-            }
-        }
-            if (config.mimEnabled) {
-                env["AETHER_MIM"] = "1"
-                if (config.mimOuter.isNotBlank()) env["AETHER_MIM_OUTER_PEER"] = config.mimOuter.trim()
-                if (config.mimInner.isNotBlank()) env["AETHER_MIM_INNER_PEER"] = config.mimInner.trim()
-            }
-            if (config.httpProxyEnabled) env["AETHER_HTTP_PROXY"] = "$httpBindHost:$actualHttpPort"
-            if (config.noDataCheck) {
-                env["AETHER_MASQUE_NO_DATA_CHECK"] = "1"
-                env["AETHER_WG_NO_DATA_CHECK"] = "1"
-            }
-            env["AETHER_QUICK_RECONNECT"] = if (config.quickReconnect) "1" else "0"
-
-
-            when (config.protocol) {
-                AetherProtocol.GOOL -> {
-                    if (config.goolClassic) {
-                        env["AETHER_GOOL_MODE"] = "classic"
-                        if (wiwOuter.isNotEmpty()) env["AETHER_WIW_OUTER_PEER"] = wiwOuter
-                        if (wiwInner.isNotEmpty()) env["AETHER_WIW_INNER_PEER"] = wiwInner
-                        if (config.wiwScan) env["AETHER_WIW_PEERS"] = "auto"
-                    } else {
-                        if (wiwOuter.isNotEmpty()) env["AETHER_PEER"] = wiwOuter
-                        if (wiwInner.isNotEmpty()) env["AETHER_GOOL_PEER"] = wiwInner
-                    }
-                }
-                AetherProtocol.WG -> {
-                    val wgPeer = config.wgPeer.trim().ifEmpty { config.peer.trim() }
-                    if (wgPeer.isNotEmpty()) {
-                        env["AETHER_WG_PEER"] = wgPeer
-                        env["AETHER_PEER"] = wgPeer
-                    }
-                }
-                else -> {
-                    if (config.peer.isNotEmpty()) env["AETHER_PEER"] = config.peer
-                }
-            }
-
-            env["AETHER_WG_KEEPALIVE"] = if (config.keepaliveEnabled) config.keepalive.toString() else "0"
-            env["AETHER_WG_ENDPOINT_COOLDOWN_SECS"] = config.wgEndpointCooldownSecs.toString()
-            env["AETHER_MASQUE_VALIDATE_SECS"] = config.validateSecs.toString()
-            env["AETHER_WG_VALIDATE_SECS"] = config.validateSecs.toString()
-            env["AETHER_MASQUE_RECONNECT_SECS"] = config.reconnectSecs.toString()
-            env["AETHER_WG_RECONNECT_SECS"] = config.reconnectSecs.toString()
-            if (config.noProfileRetry) env["AETHER_WG_NO_PROFILE_RETRY"] = "1"
-            if (config.tlsGroups.isNotEmpty()) env["AETHER_TLS_GROUPS"] = config.tlsGroups
-            if (config.masqueMtu > 0) env["AETHER_MASQUE_MTU"] = config.masqueMtu.toString()
-            if (config.netstackTcpRx > 0) env["AETHER_NETSTACK_TCP_RX"] = config.netstackTcpRx.toString()
-            if (config.netstackTcpTx > 0) env["AETHER_NETSTACK_TCP_TX"] = config.netstackTcpTx.toString()
-            if (config.protocol == AetherProtocol.ZERO_TRUST) {
-                if (config.teamName.isNotEmpty()) env["AETHER_TEAM"] = config.teamName
-                when {
-                    config.accessToken.isNotEmpty() -> env["AETHER_ACCESS_TOKEN"] = config.accessToken
-                    config.accessId.isNotEmpty() || config.accessSecret.isNotEmpty() -> {
-                        env["AETHER_ACCESS_ID"] = config.accessId
-                        env["AETHER_ACCESS_SECRET"] = config.accessSecret
-                        env["AETHER_ACCESS_CLIENT_ID"] = config.accessId
-                        env["AETHER_ACCESS_CLIENT_SECRET"] = config.accessSecret
-                    }
-                    config.accessEmail.isNotEmpty() -> env["AETHER_ACCESS_EMAIL"] = config.accessEmail
-                }
-                if (config.useGateway) env["AETHER_GATEWAY"] = "1"
-            }
-            if (config.dnsEnabled && config.dnsList.isNotEmpty()) env["AETHER_DNS"] = config.dnsList
-            if (config.upstreamProxyEnabled && config.upstreamProxy.isNotEmpty()) env["AETHER_UPSTREAM"] = config.upstreamProxy
-            env["AETHER_ROUTE_SNIFF"] = if (config.routeSniffing) "1" else "0"
-            env["AETHER_ROUTE_SNIFF_MS"] = config.sniffingTimeoutMs.toString()
-            env["AETHER_REPROVISION"] = if (config.reprovision) "1" else "0"
-
-            prepareCustomWireGuardNativeChain(config, java.io.File(systemUtils.getFilesDir()), binaryPath, command, env)
-            LogRepository.d("Executing: ${command.joinToString(" ")}")
-            if (!proc.start(command, systemUtils.getFilesDir(), env)) {
-                LogRepository.e("Failed to start process: $binaryPath")
+            val command = listOf(binaryPath, "run", "-c", configPath)
+            LogRepository.d("Executing Sing-box: ${command.joinToString(" ")}", "SingBoxCore")
+            if (!proc.start(command, workDir.absolutePath, emptyMap())) {
+                LogRepository.e("Failed to start Sing-box binary: $binaryPath", "SingBoxCore")
                 return@coroutineScope false
             }
             process = proc
-            val inputJob = launch {
-                while (isActive) {
-                    val text = inputProvider()
-                    if (text.isNotEmpty()) {
-                        proc.writeLine(text)
-                        LogRepository.d("Sent input to binary")
-                    }
-                }
-            }
+            updateState(ConnectionStatus.VALIDATING, attemptId)
+
             while (isActive && currentAttemptId.get() == attemptId) {
                 val line = proc.readLine() ?: break
-                val effectiveProtocol = if (
-                    config.exitNodeMode == ExitNodeMode.CUSTOM_WG &&
-                    config.customWgConfig.isValid() &&
-                    config.protocol in setOf(AetherProtocol.MASQUE, AetherProtocol.WG, AetherProtocol.GOOL)
-                ) AetherProtocol.GOOL else config.protocol
-                parseOutputLine(line, attemptId, effectiveProtocol, config.exitNodeMode, onCodeRequired)
+                parseSingBoxOutputLine(
+                    line = line,
+                    attemptId = attemptId,
+                    onUnknownKeepalive = onUnknownKeepalive,
+                    onTunPermissionDenied = onTunPermissionDenied
+                )
             }
-            inputJob.cancel()
+
             val exitCode = proc.waitFor()
-            LogRepository.i("Core process terminated (Exit code: $exitCode)")
+            LogRepository.i("Sing-box process terminated (Exit code: $exitCode)", "SingBoxCore")
             exitCode == 0
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             if (currentAttemptId.get() == attemptId) {
-                LogRepository.e("Binary execution runtime error: ${e.message}")
+                LogRepository.e("Sing-box runtime error: ${e.message}", "SingBoxCore")
             }
             false
         } finally {
             proc.destroy()
+            if (process === proc) process = null
         }
     }
 
-    private fun parseOutputLine(line: String, attemptId: Long, protocol: AetherProtocol, exitNodeMode: ExitNodeMode, onCodeRequired: () -> Unit) {
+    private fun parseSingBoxOutputLine(
+        line: String,
+        attemptId: Long,
+        onUnknownKeepalive: () -> Unit,
+        onTunPermissionDenied: () -> Unit
+    ) {
         if (currentAttemptId.get() != attemptId) return
         val lower = line.lowercase()
+
         when {
-            lower.contains(" error ") || lower.contains("[error]") || lower.startsWith("error:") -> LogRepository.e(line, "AetherCore")
-            lower.contains(" warn ") || lower.contains("[warn]") -> LogRepository.w(line, "AetherCore")
-            else -> LogRepository.i(line, "AetherCore")
+            lower.contains("error") || lower.contains("fatal") || lower.contains("panic") ->
+                LogRepository.e(line, "SingBoxCore")
+            lower.contains("warn") ->
+                LogRepository.w(line, "SingBoxCore")
+            else ->
+                LogRepository.i(line, "SingBoxCore")
         }
 
-        ExitDetailRegex.find(line)?.let { match ->
-            val ip = match.groupValues.getOrNull(1)?.trim() ?: ""
-            val country = match.groupValues.getOrNull(2)?.trim()?.uppercase() ?: ""
-            val colo = match.groupValues.getOrNull(3)?.trim() ?: ""
-            if (ip.isNotEmpty() && country.length == 2 && exitNodeMode == ExitNodeMode.DIRECT) {
-                IpInfoRepository.updateFromExitLine(ip, country, colo)
-            }
+        if ((lower.contains("unknown field") && lower.contains("keepalive")) || (lower.contains("wireguard") && lower.contains("deprecated"))) {
+            onUnknownKeepalive()
         }
-
-        if (protocol == AetherProtocol.ZERO_TRUST && isZeroTrustCodePrompt(lower)) {
-            onCodeRequired()
-            return
-        }
-
-        SelectedWgEndpointRegex.find(line)?.let { match ->
-            val ep = match.groupValues.getOrNull(1)?.trim() ?: ""
-            if (ep.isNotEmpty() && !ep.startsWith("127.") && !ep.startsWith("0.")) {
-                runCatching { java.io.File(systemUtils.getFilesDir(), "aether-active-endpoint.txt").writeText(ep) }
-            }
+        if ((lower.contains("configure tun interface") || lower.contains("inbound/tun")) &&
+            (lower.contains("operation not permitted") || lower.contains("access is denied") || lower.contains("permission denied") || lower.contains("wintun"))
+        ) {
+            onTunPermissionDenied()
         }
 
         when {
-            lower.contains("scanning") || lower.contains("hunting for") -> {
-                goolOuterValidated = false
-                updateState(ConnectionStatus.STARTING, attemptId)
-            }
-            lower.contains("validating") || lower.contains("establishing outer") || lower.contains("establishing inner") -> {
-                if (lower.contains("establishing inner") || (lower.contains("inner endpoint") && lower.contains("tunneled through outer"))) {
-                    goolOuterValidated = true
-                }
-                updateState(ConnectionStatus.VALIDATING, attemptId)
-            }
-            (protocol == AetherProtocol.MASQUE && (lower.contains("tunnel validated") || lower.contains("connect-ip status: 200") || (lower.contains("exit location") && lower.contains("accepted")) || (lower.contains("socks") && lower.contains("listening")))) ||
-            (protocol == AetherProtocol.MIM && (lower.contains("masque-in-masque ready") || lower.contains("inner masque tunnel established") || lower.contains("masque-in-masque exit:") || lower.contains("mim ready") || lower.contains("mim exit:") || (lower.contains("exit location") && lower.contains("accepted")))) ||
-            (protocol == AetherProtocol.ZERO_TRUST && (lower.contains("tunnel validated") || lower.contains("connect-ip status: 200") || lower.contains("handshake complete") || (lower.contains("socks") && lower.contains("listening")))) ||
-            (protocol == AetherProtocol.WG && (lower.contains("wireguard tunnel validated") || lower.contains("handshake complete") || lower.contains("tunnel validated") || (lower.contains("socks") && lower.contains("listening")))) -> {
+            lower.contains("sing-box started") ||
+            (lower.contains("inbound/socks") && lower.contains("started")) ||
+            (lower.contains("inbound/tun") && lower.contains("started")) -> {
+                updateState(ConnectionStatus.DATAPLANE_VALIDATED, attemptId)
+                updateState(ConnectionStatus.SOCKS_READY, attemptId)
                 updateState(ConnectionStatus.RUNNING, attemptId)
             }
-            (protocol == AetherProtocol.GOOL || (exitNodeMode == ExitNodeMode.CUSTOM_WG && (protocol == AetherProtocol.WG || protocol == AetherProtocol.MASQUE))) -> {
-                if (lower.contains("registering the gool") ||
-                    (lower.contains("inner endpoint") && lower.contains("tunneled through outer")) ||
-                    lower.contains("establishing inner warp tunnel") ||
-                    lower.contains("connect-ip status: 200") ||
-                    (lower.contains("tunnel validated") && !lower.contains("inner"))
-                ) {
-                    goolOuterValidated = true
+            lower.contains("outbound/wireguard") -> {
+                if (_connectionStatus.value == ConnectionStatus.STARTING) {
                     updateState(ConnectionStatus.VALIDATING, attemptId)
                 }
-                if ((lower.contains("inner") && (lower.contains("tunnel validated") || lower.contains("handshake complete"))) ||
-                    (goolOuterValidated && !lower.contains("[outer]") && (lower.contains("wireguard tunnel validated") || lower.contains("[wg] handshake done") || lower.contains("[wg] handshake success") || lower.contains("could not read the exit of"))) ||
-                    lower.contains("gool ready") ||
-                    lower.contains("gool tunnel validated") ||
-                    lower.contains("wiw tunnel validated") ||
-                    lower.contains("warp-in-warp tunnel validated") ||
-                    lower.contains("gool exit:") ||
-                    lower.contains("warp-in-warp exit:") ||
-                    (goolOuterValidated && lower.contains("serving socks5") && !lower.contains("[outer]")) ||
-                    (lower.contains("socks") && lower.contains("listening") && lower.contains("1819")) ||
-                    (lower.contains("socks") && lower.contains("listening") && lower.contains("2021")) ||
-                    (lower.contains("exit location") && lower.contains("accepted"))
-                ) {
-                    updateState(ConnectionStatus.RUNNING, attemptId)
-                }
-            }
-            (_connectionStatus.value == ConnectionStatus.RUNNING && (
-                lower.contains("reconnecting to") || lower.contains("connection lost, reconnecting") || lower.contains("tunnel lost") || lower.contains("tunnel ended") ||
-                lower.contains("wireguard tunnel exited") || lower.contains("masque tunnel ended") || lower.contains("tunnel exited")
-            )) || lower.contains("all gateways failed") -> {
-                goolOuterValidated = false
-                updateState(ConnectionStatus.RECONNECTING, attemptId)
             }
         }
     }
 
-    private fun isZeroTrustCodePrompt(line: String): Boolean {
-        return line.contains("code") && (
-            line.contains("enter") || line.contains("login") || line.contains("verif") ||
-            line.contains("confirm") || line.contains("otp") || line.contains("one-time") ||
-            line.contains("type the") || line.contains("paste") || line.contains("prompt")
+    /**
+     * Generates the Sing-box JSON configuration (`config.json`) with:
+     *  - Inbound 1: `"type": "tun"` (`"auto_route": true`, `"strict_route": true`, `"mtu": 1120`)
+     *  - Local SOCKS/HTTP inbounds on `127.0.0.1` for seamless local proxy & readiness probes
+     *  - Outbound 1 (`"warp-out"`): `"type": "wireguard"` -> Cloudflare WARP server
+     *  - Outbound 2 (`"proton-out"`): `"type": "wireguard"` -> ProtonVPN / Custom WireGuard server
+     *    with `"detour": "warp-out"`, `"mtu": 1120`, and `"keepalive": 25`
+     */
+    fun generateSingBoxConfigJson(
+        config: AetherConfig,
+        bindAddress: String,
+        warpAccount: WarpAccount,
+        includeTunInbound: Boolean = true,
+        includeKeepaliveField: Boolean = true
+    ): String {
+        val socksHost = bindAddress.substringBefore(':').ifBlank { "127.0.0.1" }
+        val socksPort = bindAddress.substringAfter(':', "2021").toIntOrNull() ?: 2021
+        val rawHttpPort = config.httpPort.toIntOrNull() ?: 2020
+        val httpPort = if (rawHttpPort == socksPort) socksPort + 1 else rawHttpPort
+
+        val targetWg = if (config.customWgAutoSelect && config.customWgProfiles.isNotEmpty()) {
+            WireGuardExitTunnel.selectFastestProfile(config.customWgProfiles, config.customWgConfig)
+        } else {
+            config.customWgConfig
+        }
+
+        val hasProtonWg = targetWg.isValid()
+        val protonEndpointRaw = targetWg.endpoint.trim().ifBlank { "185.159.157.1:51820" }
+        val protonHostRaw = if (protonEndpointRaw.startsWith("[")) {
+            protonEndpointRaw.substringAfter('[').substringBefore(']')
+        } else {
+            protonEndpointRaw.substringBeforeLast(':')
+        }.trim()
+        val protonPort = protonEndpointRaw.substringAfterLast(':', "51820").trim().toIntOrNull() ?: 51820
+        val protonServer = resolveHostToIpv4(protonHostRaw)
+        val protonV4 = targetWg.addressV4.substringBefore('/').trim().ifBlank { "10.2.0.2" }
+        val protonPrivKey = targetWg.privateKey.trim().ifBlank { warpAccount.privateKey }
+        val protonPubKey = targetWg.publicKey.trim().ifBlank { warpAccount.peerPublicKey }
+
+        val finalOutboundTag = when {
+            config.exitNodeMode == ExitNodeMode.CUSTOM_WG && hasProtonWg -> "proton-out"
+            config.exitNodeMode == ExitNodeMode.FIREFOX_VPN && config.firefoxVpnToken.isNotBlank() -> "firefox-out"
+            config.exitNodeMode == ExitNodeMode.CUSTOM_SOCKS5 && config.customSocks5Host.isNotBlank() -> "custom-socks-out"
+            hasProtonWg && config.exitNodeMode == ExitNodeMode.CUSTOM_WG -> "proton-out"
+            else -> "warp-out"
+        }
+
+        val keepaliveProp = if (includeKeepaliveField) ",\n      \"keepalive\": 25" else ""
+
+        val inboundsList = mutableListOf<String>()
+        if (includeTunInbound) {
+            inboundsList.add(
+                """
+                {
+                  "type": "tun",
+                  "tag": "tun-in",
+                  "interface_name": "aether-tun0",
+                  "inet4_address": "172.19.0.1/30",
+                  "mtu": 1120,
+                  "auto_route": true,
+                  "strict_route": true,
+                  "stack": "system",
+                  "sniff": true
+                }
+                """.trimIndent()
+            )
+        }
+        inboundsList.add(
+            """
+            {
+              "type": "socks",
+              "tag": "socks-in",
+              "listen": "$socksHost",
+              "listen_port": $socksPort,
+              "sniff": true
+            }
+            """.trimIndent()
         )
+        inboundsList.add(
+            """
+            {
+              "type": "http",
+              "tag": "http-in",
+              "listen": "$socksHost",
+              "listen_port": $httpPort,
+              "sniff": true
+            }
+            """.trimIndent()
+        )
+        if (socksPort != 10805) {
+            inboundsList.add(
+                """
+                {
+                  "type": "socks",
+                  "tag": "socks-wg-exit-in",
+                  "listen": "127.0.0.1",
+                  "listen_port": 10805,
+                  "sniff": true
+                }
+                """.trimIndent()
+            )
+        }
+
+        val extraOutbounds = mutableListOf<String>()
+        if (config.exitNodeMode == ExitNodeMode.FIREFOX_VPN && config.firefoxVpnToken.isNotBlank()) {
+            val jwt = runCatching {
+                FirefoxVpnExitTunnel.resolveLiveProxyPassJwt(config.firefoxVpnToken, "127.0.0.1", 0)
+            }.getOrNull() ?: config.firefoxVpnToken.trim()
+            val ffEdge = FirefoxVpnExitTunnel.resolveCountryExitCandidates(config.firefoxVpnCountry, "127.0.0.1", 0).first()
+            val authVal = if (jwt.startsWith("ProxyPass ", ignoreCase = true) || jwt.startsWith("Bearer ", ignoreCase = true)) {
+                jwt
+            } else {
+                "ProxyPass $jwt"
+            }
+            extraOutbounds.add(
+                """
+                {
+                  "type": "http",
+                  "tag": "firefox-out",
+                  "detour": "warp-out",
+                  "server": "${ffEdge.host}",
+                  "server_port": ${ffEdge.port},
+                  "tls": {
+                    "enabled": true,
+                    "server_name": "${ffEdge.host}"
+                  },
+                  "headers": {
+                    "Proxy-Authorization": "$authVal",
+                    "User-Agent": "MozillaVPN/2.35.0 (sys:linux; iap:true)"
+                  }
+                }
+                """.trimIndent()
+            )
+        }
+        if (config.exitNodeMode == ExitNodeMode.CUSTOM_SOCKS5 && config.customSocks5Host.isNotBlank()) {
+            extraOutbounds.add(
+                """
+                {
+                  "type": "socks",
+                  "tag": "custom-socks-out",
+                  "detour": "warp-out",
+                  "server": "${config.customSocks5Host.trim()}",
+                  "server_port": ${config.customSocks5Port},
+                  "username": "${config.customSocks5Username}",
+                  "password": "${config.customSocks5Password}"
+                }
+                """.trimIndent()
+            )
+        }
+
+        val extraOutboundBlock = if (extraOutbounds.isNotEmpty()) {
+            ",\n    " + extraOutbounds.joinToString(",\n    ")
+        } else ""
+
+        val logLevel = if (config.coreLogLevel == AetherLogLevel.DEBUG) "debug" else "info"
+
+        return """
+{
+  "log": {
+    "level": "$logLevel",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "dns-remote",
+        "address": "tcp://1.1.1.1",
+        "detour": "$finalOutboundTag"
+      },
+      {
+        "tag": "dns-direct",
+        "address": "local",
+        "detour": "direct"
+      }
+    ],
+    "final": "dns-remote"
+  },
+  "inbounds": [
+    ${inboundsList.joinToString(",\n    ")}
+  ],
+  "outbounds": [
+    {
+      "type": "wireguard",
+      "tag": "warp-out",
+      "server": "${warpAccount.server}",
+      "server_port": ${warpAccount.serverPort},
+      "local_address": [
+        "${warpAccount.ipv4}/32"
+      ],
+      "private_key": "${warpAccount.privateKey}",
+      "peer_public_key": "${warpAccount.peerPublicKey}",
+      "reserved": [${warpAccount.reserved.joinToString(", ")}],
+      "mtu": 1280$keepaliveProp
+    },
+    {
+      "type": "wireguard",
+      "tag": "proton-out",
+      "detour": "warp-out",
+      "server": "$protonServer",
+      "server_port": $protonPort,
+      "local_address": [
+        "$protonV4/32"
+      ],
+      "private_key": "$protonPrivKey",
+      "peer_public_key": "$protonPubKey",
+      "mtu": 1120$keepaliveProp
+    }$extraOutboundBlock,
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "final": "$finalOutboundTag"
+  }
+}
+        """.trimIndent()
+    }
+
+    private fun resolveOrRegisterWarpAccount(config: AetherConfig, workDir: File): WarpAccount {
+        val configuredEndpoint = config.wgPeer.trim().ifEmpty { config.peer.trim() }
+            .ifEmpty { config.wiwOuter.trim() }
+        val defaultEndpoint = if (configuredEndpoint.contains(':')) {
+            val h = configuredEndpoint.substringBeforeLast(':').trim()
+            val p = configuredEndpoint.substringAfterLast(':', "2408").toIntOrNull() ?: 2408
+            h to p
+        } else {
+            resolveBestSavedWarpEndpoint(workDir)
+        }
+
+        val customPriv = config.customWgConfig.privateKey.trim()
+        val candidateFiles = listOf(
+            File(workDir, "aether-singbox-warp.toml"),
+            File(workDir, "aether.toml"),
+            File(workDir, "aether-wg.toml"),
+            File(File(System.getProperty("user.home") ?: ".", ".aether"), "aether.toml")
+        )
+
+        for (file in candidateFiles) {
+            if (file.exists() && file.length() > 0) {
+                val parsed = parseWarpToml(file, customPriv, defaultEndpoint)
+                if (parsed != null) return parsed
+            }
+        }
+
+        val registered = registerCloudflareWarpOnline(workDir, defaultEndpoint)
+        if (registered != null) return registered
+
+        val fallbackKeys = WireGuardCrypto.generateKeyPair()
+        return WarpAccount(
+            deviceId = UUID.randomUUID().toString(),
+            accessToken = UUID.randomUUID().toString(),
+            server = defaultEndpoint.first,
+            serverPort = defaultEndpoint.second,
+            ipv4 = "172.16.0.2",
+            ipv6 = "2606:4700:110::2",
+            privateKey = fallbackKeys.privateKey,
+            peerPublicKey = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+            reserved = listOf(0, 0, 0)
+        )
+    }
+
+    private fun resolveBestSavedWarpEndpoint(workDir: File): Pair<String, Int> {
+        val epRegex = Regex("""(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d{2,5})""")
+        val activeFile = File(workDir, "aether-active-endpoint.txt")
+        if (activeFile.exists()) {
+            val m = epRegex.find(runCatching { activeFile.readText() }.getOrDefault(""))
+            if (m != null) {
+                val ip = m.groupValues[1]
+                val port = m.groupValues[2].toIntOrNull() ?: 2408
+                if (!ip.startsWith("127.") && ip != "0.0.0.0") return ip to port
+            }
+        }
+        val lastConnFiles = workDir.listFiles { f -> f.name.contains("lastconn", ignoreCase = true) }
+            ?.sortedByDescending { it.lastModified() }
+            .orEmpty()
+        for (f in lastConnFiles) {
+            val m = epRegex.find(runCatching { f.readText() }.getOrDefault(""))
+            if (m != null) {
+                val ip = m.groupValues[1]
+                val port = m.groupValues[2].toIntOrNull() ?: 2408
+                if (!ip.startsWith("127.") && ip != "0.0.0.0") return ip to port
+            }
+        }
+        return "162.159.192.1" to 2408
+    }
+
+    private fun parseWarpToml(file: File, customPrivateKey: String, endpoint: Pair<String, Int>): WarpAccount? {
+        return try {
+            val text = file.readText()
+            if (text.contains("custom-wg-inner")) return null
+            var devId = UUID.randomUUID().toString()
+            var token = UUID.randomUUID().toString()
+            var server = endpoint.first
+            var port = endpoint.second
+            var ipv4 = "172.16.0.2"
+            var ipv6 = "2606:4700:110::2"
+            var privKey = ""
+            var pubKey = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+            val reserved = mutableListOf(0, 0, 0)
+
+            for (line in text.lines()) {
+                val clean = line.substringBefore('#').trim()
+                if (!clean.contains('=')) continue
+                val k = clean.substringBefore('=').trim().lowercase()
+                val v = clean.substringAfter('=').trim().trim('"', '\'')
+                when (k) {
+                    "device_id" -> if (v.isNotBlank()) devId = v
+                    "access_token" -> if (v.isNotBlank()) token = v
+                    "assigned_endpoint" -> {
+                        if (v.isNotBlank() && !v.startsWith("0.0.0.0") && server == "162.159.192.1") {
+                            server = v.substringBefore(':')
+                            port = v.substringAfter(':', "2408").toIntOrNull() ?: 2408
+                        }
+                    }
+                    "ipv4" -> if (v.isNotBlank()) ipv4 = v.substringBefore('/')
+                    "ipv6" -> if (v.isNotBlank()) ipv6 = v.substringBefore('/')
+                    "wg_private_key" -> if (v.isNotBlank()) privKey = v
+                    "wg_peer_public_key" -> if (v.isNotBlank()) pubKey = v
+                    "client_id" -> {
+                        if (v.isNotBlank()) {
+                            runCatching {
+                                val bytes = Base64.getDecoder().decode(v)
+                                if (bytes.size >= 3) {
+                                    reserved[0] = bytes[0].toInt() and 0xFF
+                                    reserved[1] = bytes[1].toInt() and 0xFF
+                                    reserved[2] = bytes[2].toInt() and 0xFF
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (privKey.isNotBlank() && privKey != customPrivateKey) {
+                WarpAccount(
+                    deviceId = devId,
+                    accessToken = token,
+                    server = server,
+                    serverPort = port,
+                    ipv4 = ipv4,
+                    ipv6 = ipv6,
+                    privateKey = privKey,
+                    peerPublicKey = pubKey,
+                    reserved = reserved
+                )
+            } else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun registerCloudflareWarpOnline(workDir: File, endpoint: Pair<String, Int>): WarpAccount? {
+        return try {
+            val keyPair = WireGuardCrypto.generateKeyPair()
+            val regBody = """{"key":"${keyPair.publicKey}","install_id":"","fcm_token":"","tos":"2026-01-01T00:00:00.000Z","model":"PC","serial_number":"${UUID.randomUUID()}","locale":"en_US"}"""
+            val url = java.net.URL("https://api.cloudflareclient.com/v0a2158/reg")
+            val conn = (url.openConnection() as java.net.HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 5000
+                readTimeout = 5000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+                setRequestProperty("Accept", "application/json")
+                setRequestProperty("CF-Client-Version", "a-6.30-2158")
+            }
+            conn.outputStream.use { it.write(regBody.toByteArray(Charsets.UTF_8)) }
+            val resp = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            val devId = Regex(""""id"\s*:\s*"([^"]+)"""").find(resp)?.groupValues?.get(1) ?: return null
+            val token = Regex(""""token"\s*:\s*"([^"]+)"""").find(resp)?.groupValues?.get(1) ?: devId
+            val clientId = Regex(""""client_id"\s*:\s*"([^"]+)"""").find(resp)?.groupValues?.get(1) ?: "AAAA"
+            val v4 = Regex(""""v4"\s*:\s*"([^"]+)"""").find(resp)?.groupValues?.get(1)?.substringBefore('/') ?: "172.16.0.2"
+            val v6 = Regex(""""v6"\s*:\s*"([^"]+)"""").find(resp)?.groupValues?.get(1)?.substringBefore('/') ?: "2606:4700:110::2"
+            val peerPub = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+
+            val toml = buildString {
+                appendLine("""device_id = "$devId"""")
+                appendLine("""access_token = "$token"""")
+                appendLine("""ipv4 = "$v4"""")
+                appendLine("""ipv6 = "$v6"""")
+                appendLine("""wg_private_key = "${keyPair.privateKey}"""")
+                appendLine("""wg_peer_public_key = "$peerPub"""")
+                appendLine("""assigned_endpoint = "${endpoint.first}:${endpoint.second}"""")
+                appendLine("""client_id = "$clientId"""")
+            }
+            runCatching { File(workDir, "aether-singbox-warp.toml").writeText(toml) }
+
+            val reserved = runCatching {
+                val b = Base64.getDecoder().decode(clientId)
+                if (b.size >= 3) listOf(b[0].toInt() and 0xFF, b[1].toInt() and 0xFF, b[2].toInt() and 0xFF)
+                else listOf(0, 0, 0)
+            }.getOrDefault(listOf(0, 0, 0))
+
+            WarpAccount(
+                deviceId = devId,
+                accessToken = token,
+                server = endpoint.first,
+                serverPort = endpoint.second,
+                ipv4 = v4,
+                ipv6 = v6,
+                privateKey = keyPair.privateKey,
+                peerPublicKey = peerPub,
+                reserved = reserved
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun resolveHostToIpv4(host: String): String {
+        if (host.matches(Regex("""^\d{1,3}(\.\d{1,3}){3}$""")) || host.contains(':')) return host
+        return runCatching {
+            InetAddress.getAllByName(host).firstOrNull { it is Inet4Address }?.hostAddress ?: host
+        }.getOrDefault(host)
     }
 
     private fun updateState(state: ConnectionStatus, attemptId: Long) {
         if (currentAttemptId.get() == attemptId) _connectionStatus.value = state
     }
 
-    private fun writeRoutingFile(config: AetherConfig): java.io.File? {
-        val block = config.routingRules.filter { it.mode == RoutingMode.BLOCK }
-        val direct = config.routingRules.filter { it.mode == RoutingMode.DIRECT }
-
-        if (block.isEmpty() && direct.isEmpty()) return null
-
-        return try {
-            val file = java.io.File(systemUtils.getFilesDir(), "routing.ast")
-            val content = StringBuilder()
-
-            if (block.isNotEmpty()) {
-                content.append("[block]\n")
-                block.forEach { content.append(formatRoutingPattern(it.pattern)).append("\n") }
-                content.append("\n")
-            }
-
-            if (direct.isNotEmpty()) {
-                content.append("[direct]\n")
-                direct.forEach { content.append(formatRoutingPattern(it.pattern)).append("\n") }
-                content.append("\n")
-            }
-
-            file.writeText(content.toString())
-            LogRepository.i("Routing file generated with ${block.size} blocked and ${direct.size} direct rules.")
-            file
-        } catch (e: Exception) {
-            LogRepository.e("Failed to write routing file: ${e.message}")
-            null
-        }
-    }
-
-    private fun formatRoutingPattern(pattern: String): String {
-        val trimmed = pattern.trim()
-        if (trimmed.startsWith("domain:") || trimmed.startsWith("ip:") ||
-            trimmed.startsWith("keyword:") || trimmed.startsWith("regexp:") ||
-            trimmed == "private") {
-            return trimmed
-        }
-
-        val isIp = trimmed.all { it.isDigit() || it == '.' || it == ':' || it == '/' || (it.lowercaseChar() in 'a'..'f') } &&
-                (trimmed.contains('.') || trimmed.contains(':'))
-
-        return if (isIp) "ip:$trimmed" else "domain:$trimmed"
-    }
-
     fun stop() {
         currentAttemptId.incrementAndGet()
-        goolOuterValidated = false
         _connectionStatus.value = ConnectionStatus.STOPPED
         runnerJob?.cancel()
         process?.destroy()
         process = null
-        LogRepository.i("System core shutdown initiated.")
+        LogRepository.i("Sing-box core shutdown initiated.", "SingBoxCore")
     }
 
     fun release() {
         stop()
         scope.cancel()
     }
-
-    private fun prepareCustomWireGuardNativeChain(
-        config: AetherConfig,
-        workDir: java.io.File,
-        binaryPath: String,
-        command: MutableList<String>,
-        env: MutableMap<String, String>
-    ) {
-        val innerFiles = listOf(
-            java.io.File(workDir, "aether-gool.toml"),
-            java.io.File(workDir, "aether-masque-gool.toml"),
-            java.io.File(workDir, "aether-secondary.toml"),
-            java.io.File(workDir, "aether-wg-secondary.toml")
-        )
-
-        if (config.exitNodeMode != ExitNodeMode.CUSTOM_WG || !config.customWgConfig.isValid()) {
-            for (f in innerFiles) {
-                runCatching {
-                    val corrupt = java.io.File(workDir, "${f.name}.corrupt")
-                    if (corrupt.exists()) corrupt.delete()
-                    if (f.exists()) {
-                        val txt = f.readText()
-                        if (txt.contains("custom-wg-inner")) {
-                            f.delete()
-                        }
-                    }
-                }
-            }
-            return
-        }
-
-        workDir.listFiles()?.forEach { f ->
-            if (f.name.endsWith(".corrupt")) runCatching { f.delete() }
-        }
-
-        val customWg = config.customWgConfig
-        val rawEndpoint = customWg.endpoint.trim()
-        val hostPart = if (rawEndpoint.startsWith("[")) {
-            rawEndpoint.substringAfter('[').substringBefore(']')
-        } else {
-            rawEndpoint.substringBeforeLast(':')
-        }.trim()
-        val portPart = rawEndpoint.substringAfterLast(':', "51820").trim().toIntOrNull() ?: 51820
-        val resolvedHost = runCatching {
-            if (hostPart.matches(Regex("""^\d{1,3}(\.\d{1,3}){3}$""")) || hostPart.contains(':')) {
-                hostPart
-            } else {
-                java.net.InetAddress.getAllByName(hostPart)
-                    .firstOrNull { it is java.net.Inet4Address }
-                    ?.hostAddress ?: hostPart
-            }
-        }.getOrDefault(hostPart)
-        val innerEndpoint = "$resolvedHost:$portPart"
-
-        val cleanIpv4 = customWg.addressV4.substringBefore('/').trim().ifBlank { "10.2.0.2" }
-        val cleanIpv6 = customWg.addressV6.substringBefore('/').trim().ifBlank { "fd00::2" }
-
-        val customPriv = customWg.privateKey.trim()
-        for (outerName in listOf("aether.toml", "aether-wg.toml", "aether-masque.toml")) {
-            val outerFile = java.io.File(workDir, outerName)
-            runCatching {
-                if (outerFile.exists()) {
-                    val txt = outerFile.readText()
-                    if ((customPriv.isNotEmpty() && txt.contains(customPriv)) || !txt.contains("ipv6")) {
-                        outerFile.delete()
-                    }
-                }
-            }
-        }
-        val primaryOuter = java.io.File(workDir, "aether.toml")
-        if (!primaryOuter.exists() || primaryOuter.length() == 0L) {
-            runCatching {
-                val regPb = ProcessBuilder(binaryPath, "--register", "wg", "--config", primaryOuter.absolutePath)
-                regPb.directory(workDir)
-                val p = regPb.start()
-                p.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)
-                if (p.isAlive) p.destroyForcibly()
-            }
-        }
-
-        if (primaryOuter.exists() && primaryOuter.length() > 0L &&
-            (config.protocol == AetherProtocol.WG || config.protocol == AetherProtocol.GOOL || config.protocol == AetherProtocol.MASQUE)
-        ) {
-            val innerToml = buildString {
-                appendLine("""device_id = "custom-wg-inner"""")
-                appendLine("""access_token = "custom-wg-token"""")
-                appendLine("""ipv4 = "$cleanIpv4"""")
-                appendLine("""ipv6 = "$cleanIpv6"""")
-                appendLine("""wg_private_key = "${customWg.privateKey.trim()}"""")
-                appendLine("""wg_peer_public_key = "${customWg.publicKey.trim()}"""")
-                appendLine("""assigned_endpoint = "$innerEndpoint"""")
-                appendLine("""client_id = "AAAA"""")
-            }
-            for (f in innerFiles) {
-                runCatching { f.writeText(innerToml) }
-            }
-
-            val useClassic = config.protocol == AetherProtocol.WG || (config.protocol == AetherProtocol.GOOL && config.goolClassic)
-            command.removeAll(listOf("--wg", "--masque", "--gool", "--gool-classic", "--no-data-check"))
-
-            fun removeFlagWithArg(flag: String) {
-                var idx = command.indexOf(flag)
-                while (idx != -1) {
-                    command.removeAt(idx)
-                    if (idx < command.size) command.removeAt(idx)
-                    idx = command.indexOf(flag)
-                }
-            }
-            removeFlagWithArg("--wiw-inner")
-            removeFlagWithArg("--gool-peer")
-            removeFlagWithArg("--api-address")
-            removeFlagWithArg("--dns")
-
-            val customDns = customWg.dnsServers.firstOrNull { it.isNotBlank() } ?: "10.2.0.1"
-            val combinedDns = "$customDns,1.1.1.1,1.0.0.1"
-
-            if (useClassic) {
-                command.add("--gool-classic")
-                command.add("--wiw-inner")
-                command.add(innerEndpoint)
-                env["AETHER_PROTOCOL"] = "gool"
-                env["AETHER_GOOL_MODE"] = "classic"
-                env["AETHER_WIW_INNER_PEER"] = innerEndpoint
-            } else {
-                command.add("--gool")
-                command.add("--gool-peer")
-                command.add(innerEndpoint)
-                env["AETHER_PROTOCOL"] = "gool"
-                env["AETHER_GOOL_INNER"] = innerEndpoint
-                env["AETHER_GOOL_PEER"] = innerEndpoint
-            }
-
-            command.add("--api-address")
-            command.add("127.0.0.1:1")
-            command.add("--no-data-check")
-            command.add("--dns")
-            command.add(combinedDns)
-
-            env["AETHER_API_ADDRESS"] = "127.0.0.1:1"
-            env["AETHER_REPROVISION"] = "0"
-            env["AETHER_WG_NO_DATA_CHECK"] = "1"
-            env["AETHER_WG_STALE_SECS"] = "86400"
-            env["AETHER_DNS"] = combinedDns
-        }
-    }
-
 }

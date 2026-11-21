@@ -26,29 +26,26 @@ import io.github.immaghzbad.aetherst.core.HevTun2SocksConfig
 import io.github.immaghzbad.aetherst.core.HevTun2SocksEngine
 import io.github.immaghzbad.aetherst.core.HevTun2SocksNative
 import io.github.immaghzbad.aetherst.core.PsiphonController
-import io.github.immaghzbad.aetherst.core.TorController
 import io.github.immaghzbad.aetherst.core.RoutingEngine
 import io.github.immaghzbad.aetherst.core.SocksGate
-import io.github.immaghzbad.aetherst.core.SocksTunBridge
+import io.github.immaghzbad.aetherst.core.TorController
 import io.github.immaghzbad.aetherst.platform.PlatformContext
 import io.github.immaghzbad.aetherst.platform.getSettings
 import io.github.immaghzbad.aetherst.shared.data.ActiveProxyProvider
-import io.github.immaghzbad.aetherst.shared.data.IpInfoRepository
 import io.github.immaghzbad.aetherst.shared.data.AetherConfigRepository
+import io.github.immaghzbad.aetherst.shared.data.IpInfoRepository
 import io.github.immaghzbad.aetherst.shared.data.LogRepository
 import io.github.immaghzbad.aetherst.shared.model.AetherIpMode
 import io.github.immaghzbad.aetherst.shared.model.ChainProvider
 import io.github.immaghzbad.aetherst.shared.model.ConnectionMode
 import io.github.immaghzbad.aetherst.shared.model.ConnectionStatus
-import io.github.immaghzbad.aetherst.shared.model.CustomWireGuardConfig
 import io.github.immaghzbad.aetherst.shared.model.ExitNodeMode
-import io.github.immaghzbad.aetherst.shared.model.RoutingMode
 import io.github.immaghzbad.aetherst.shared.model.SocksReadiness
 import io.github.immaghzbad.aetherst.shared.model.TunnelEngine
 import io.github.immaghzbad.aetherst.shared.net.CustomSocks5Relay
+import io.github.immaghzbad.aetherst.shared.net.FirefoxVpnExitTunnel
 import io.github.immaghzbad.aetherst.shared.net.WireGuardExitTunnel
 import io.github.immaghzbad.aetherst.shared.platform.Bridge
-import io.github.immaghzbad.aetherst.shared.util.WireGuardConfigParser
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -63,26 +60,27 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import java.io.InputStream
-import java.net.InetAddress
-import java.net.InetSocketAddress
-import java.net.Socket
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.time.Duration.Companion.milliseconds
 
+/**
+ * Android VpnService controller for the Sing-box Core Architecture.
+ * All custom Kotlin packet handling (`SocksTunBridge`) has been completely removed.
+ * Data-plane routing and WireGuard-in-WireGuard (`warp-out` -> `proton-out` with `detour: "warp-out"`)
+ * are handled natively by `sing-box`.
+ */
 @Suppress("VpnServicePolicy")
 class AetherVpnService : VpnService() {
 
     private var vpnInterface: ParcelFileDescriptor? = null
     private var hevEngine: HevTun2SocksEngine? = null
-    private var socksBridge: SocksTunBridge? = null
     private var routingEngine: RoutingEngine? = null
     private var activeTunnelEngine: TunnelEngine? = null
     private var customSocksRelay: CustomSocks5Relay? = null
     private val exitTunnelLock = Any()
     @Volatile private var exitTunnelNeedsRefresh = false
     private var wgExitTunnel: WireGuardExitTunnel? = null
-    private var firefoxVpnTunnel: io.github.immaghzbad.aetherst.shared.net.FirefoxVpnExitTunnel? = null
+    private var firefoxVpnTunnel: FirefoxVpnExitTunnel? = null
 
     private var wakeLock: PowerManager.WakeLock? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -92,7 +90,6 @@ class AetherVpnService : VpnService() {
     private var startupJob: Job? = null
     private var statsJob: Job? = null
     private var lastHevUpstream: String? = null
-    private var lastBridgeUpstream: String? = null
 
     private var isUserInitiatedStop = false
     private var wasEverRunning = false
@@ -344,8 +341,6 @@ class AetherVpnService : VpnService() {
                 stateMutex.withLock {
                     hevEngine?.requestStop()
                     hevEngine = null
-                    socksBridge?.stop()
-                    socksBridge = null
                     closeVpnInterface(attemptId)
                     activeTunnelEngine = null
                 }
@@ -380,23 +375,14 @@ class AetherVpnService : VpnService() {
             try {
                 val config = AetherConfigRepository.getInstance(getSettings(PlatformContext(this@AetherVpnService))).config.value
                 routingEngine = RoutingEngine(config.routingRules)
-
-                val hasDomainRules = config.routingRules.any { it.mode == RoutingMode.BLOCK || it.mode == RoutingMode.DIRECT } || config.bypassIran
-                val effectiveEngine = if (
-                    hasDomainRules && config.tunnelEngine == TunnelEngine.HEV_TUN2SOCKS
-                ) {
-                    TunnelEngine.SOCKS_TUN_BRIDGE
-                } else {
-                    config.tunnelEngine
-                }
-                activeTunnelEngine = effectiveEngine
+                activeTunnelEngine = TunnelEngine.HEV_TUN2SOCKS
                 wasEverRunning = false
 
-                // گام ۱: ابتدا هسته و زنجیره (Psiphon/Tor) بدون اختلال تونل مجازی متصل و تایید شوند
+                // Step 1: Start Sing-box core (which generates config.json with warp-out & proton-out detour)
                 getController().start()
                 val postCoreStatus = ConnectionController.status.value
                 if (postCoreStatus != ConnectionStatus.RUNNING && postCoreStatus != ConnectionStatus.VALIDATING) {
-                    throw IllegalStateException("Core failed to start")
+                    throw IllegalStateException("Sing-box core failed to start")
                 }
                 ensureCurrentAttempt(attemptId)
 
@@ -405,10 +391,9 @@ class AetherVpnService : VpnService() {
                     ActiveProxyProvider.customWgPort = null
                 }
 
-                // گام ۱.۵: راه‌اندازی سایفون در صورت فعال بودن ExitNodeMode.PSIPHON_POOL
                 if (config.exitNodeMode == ExitNodeMode.PSIPHON_POOL && !PsiphonController.isRunning()) {
                     val httpUpstream = "http://127.0.0.1:${config.httpPort.ifBlank { "2020" }}"
-                    LogRepository.i("[VpnService] Starting Psiphon core over primary core (upstream=$httpUpstream)")
+                    LogRepository.i("[VpnService] Starting Psiphon core over Sing-box core (upstream=$httpUpstream)")
                     PsiphonController.start(this@AetherVpnService, config, upstream = httpUpstream)
                     var wait = 0
                     while (wait < 30 && !PsiphonController.isConnected()) {
@@ -424,8 +409,7 @@ class AetherVpnService : VpnService() {
                     }
                 }
 
-                // گام ۲: ابتدا لایه دوم (WireGuard Exit / Firefox VPN / Custom SOCKS5) را روی لایه اول Aether بالا و تایید می‌کنیم
-                // تا قبل از آماده‌شدن کامل زنجیره دو لایه، کارت شبکه TUN اندروید ترافیک سیستم را به تونل ناقص هدایت نکند.
+                // Step 2: Resolve active Sing-box SOCKS endpoint
                 exitTunnelNeedsRefresh = false
                 val (targetHost, targetPort) = resolveEffectiveSocks(
                     config = config,
@@ -434,9 +418,9 @@ class AetherVpnService : VpnService() {
                 )
                 ensureCurrentAttempt(attemptId)
 
-                // گام ۳: ایجاد رابط TUN با MTU بهینه (1120 برای زنجیره‌سازی دو لایه وایرگارد جهت جلوگیری از MTU Blackhole)
+                // Step 3: Establish Android VpnService TUN interface with MTU=1120 for two-stage WireGuard
                 if (vpnInterface == null) {
-                    if (!establishVpnTun(attemptId, effectiveEngine)) throw IllegalStateException("TUN establishment failed")
+                    if (!establishVpnTun(attemptId)) throw IllegalStateException("TUN establishment failed")
                 }
                 ensureCurrentAttempt(attemptId)
                 val descriptor = vpnInterface ?: throw IllegalStateException("TUN descriptor unavailable")
@@ -445,59 +429,42 @@ class AetherVpnService : VpnService() {
                 val effectiveMtu = maxSafeMtu.coerceAtMost(config.mtu.coerceIn(576, 9000))
                 SocksGate.setReady(SocksReadiness.PROBED_OK)
 
-                if (effectiveEngine == TunnelEngine.HEV_TUN2SOCKS) {
-                    if (!HevTun2SocksNative.isAvailable) throw IllegalStateException("HEV Native library not available")
+                if (!HevTun2SocksNative.isAvailable) throw IllegalStateException("HEV Native library not available")
 
-                    hevEngine?.requestStop()
-                    hevEngine = HevTun2SocksEngine()
+                hevEngine?.requestStop()
+                hevEngine = HevTun2SocksEngine()
 
-                    val hevSettings = HevEngineSettings(
-                        logLevel = config.hevLogLevel,
-                        connectTimeoutMs = config.hevConnectTimeoutMs,
-                        readWriteTimeoutMs = config.hevReadWriteTimeoutMs,
-                        maxSessionCount = config.hevMaxSessionCount,
-                        mapdnsCacheSize = config.hevMapdnsCacheSize
-                    )
+                val hevSettings = HevEngineSettings(
+                    logLevel = config.hevLogLevel,
+                    connectTimeoutMs = config.hevConnectTimeoutMs,
+                    readWriteTimeoutMs = config.hevReadWriteTimeoutMs,
+                    maxSessionCount = config.hevMaxSessionCount,
+                    mapdnsCacheSize = config.hevMapdnsCacheSize
+                )
 
-                    val ok = hevEngine?.start(
-                        tunPfd = descriptor,
-                        socksAddress = targetHost,
-                        socksPort = targetPort,
-                        mtu = effectiveMtu,
-                        attemptId = attemptId,
-                        settings = hevSettings,
-                        udpMode = if (
-                            ActiveProxyProvider.psiphonProxyUrl != null ||
-                            config.chainProvider == ChainProvider.PSIPHON ||
-                            config.exitNodeMode == ExitNodeMode.PSIPHON_POOL ||
-                            config.exitNodeMode == ExitNodeMode.FIREFOX_VPN ||
-                            config.chainProvider == ChainProvider.TOR
-                        ) "tcp" else config.hevUdpMode
-                    ) == true
-                    if (!ok) throw IllegalStateException("HEV engine failed to start mtu=$effectiveMtu")
-                    lastHevUpstream = "$targetHost:$targetPort"
-                } else {
-                    socksBridge?.stop()
-                    socksBridge = SocksTunBridge(
-                        vpnService = this@AetherVpnService,
-                        tunDescriptor = descriptor,
-                        socksHost = targetHost,
-                        socksPort = targetPort,
-                        mtu = effectiveMtu,
-                        blockedPackagesProvider = {
-                            AetherConfigRepository.getInstance(getSettings(PlatformContext(this@AetherVpnService))).config.value.blockedPackages
-                        },
-                        routingEngine = routingEngine!!
-                    ).apply { start() }
-                    lastBridgeUpstream = "$targetHost:$targetPort"
-                }
+                val ok = hevEngine?.start(
+                    tunPfd = descriptor,
+                    socksAddress = targetHost,
+                    socksPort = targetPort,
+                    mtu = effectiveMtu,
+                    attemptId = attemptId,
+                    settings = hevSettings,
+                    udpMode = if (
+                        ActiveProxyProvider.psiphonProxyUrl != null ||
+                        config.chainProvider == ChainProvider.PSIPHON ||
+                        config.exitNodeMode == ExitNodeMode.PSIPHON_POOL ||
+                        config.exitNodeMode == ExitNodeMode.FIREFOX_VPN ||
+                        config.chainProvider == ChainProvider.TOR
+                    ) "tcp" else config.hevUdpMode
+                ) == true
+                if (!ok) throw IllegalStateException("HEV engine failed to start mtu=$effectiveMtu")
+                lastHevUpstream = "$targetHost:$targetPort"
 
                 wasEverRunning = true
                 getController().promoteToRunning()
                 startStatsJob()
-                LogRepository.i("[VpnService] VPN tunnel active on $targetHost:$targetPort (MTU=$effectiveMtu)")
+                LogRepository.i("[VpnService] Sing-box VPN tunnel active on $targetHost:$targetPort (MTU=$effectiveMtu)")
 
-                // به‌روزرسانی فوری آی‌پی خروجی لایه دوم در داشبورد
                 if (config.exitNodeMode != ExitNodeMode.DIRECT) {
                     scope.launch {
                         delay(400.milliseconds)
@@ -518,34 +485,24 @@ class AetherVpnService : VpnService() {
         if (activeAttemptId.get() != attemptId) throw IllegalStateException("Connection attempt invalidated")
     }
 
-    private fun establishVpnTun(attemptId: Long, engine: TunnelEngine): Boolean = runCatching {
+    private fun establishVpnTun(attemptId: Long): Boolean = runCatching {
         val config = AetherConfigRepository.getInstance(getSettings(PlatformContext(this))).config.value
         val maxSafeMtu = if (config.exitNodeMode == ExitNodeMode.CUSTOM_WG) 1120 else 1280
         val effectiveMtu = maxSafeMtu.coerceAtMost(config.mtu.coerceIn(576, 9000))
         val pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         val builder = Builder()
             .setMtu(effectiveMtu)
-            .setSession("AetherST Tunnel")
+            .setSession("AetherST Sing-box Tunnel")
             .setConfigureIntent(PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), pendingFlags))
 
         val wgConfig = if (config.exitNodeMode == ExitNodeMode.CUSTOM_WG) config.customWgConfig else null
         val supportsIpv6 = config.effectiveIpMode() == AetherIpMode.DUAL || config.effectiveIpMode() == AetherIpMode.IPV6 || config.ipv6Leak
         val filteredWg = wgConfig?.filterForPrimarySupport(supportsIpv6)
 
-        // استک lwIP در HEV_TUN2SOCKS و SocksTunBridge روی 198.18.0.1/24 و MapDNS 198.18.0.2 کار می‌کند؛
-        // آدرس داخلی وایرگارد لایه دوم (مثل 10.2.0.2) متعلق به netstack داخلی sing-box است و نباید روی TUN اندروید ست شود.
         builder.addAddress("198.18.0.1", 24)
         builder.addAddress("fd00::1", 120)
         builder.addRoute("0.0.0.0", 0)
-
-        if (engine == TunnelEngine.HEV_TUN2SOCKS) {
-            builder.addDnsServer(HevTun2SocksConfig.MAP_DNS_ADDRESS)
-        } else {
-            builder.addDnsServer("1.1.1.1")
-            builder.addDnsServer("8.8.8.8")
-            builder.addDnsServer("2606:4700:4700::1111")
-            builder.addDnsServer("2001:4860:4860::8888")
-        }
+        builder.addDnsServer(HevTun2SocksConfig.MAP_DNS_ADDRESS)
 
         if ((filteredWg?.allowedIpsV6?.isNotEmpty() == true || config.ipv6Leak) && Build.VERSION.SDK_INT > Build.VERSION_CODES.O_MR1) {
             runCatching { builder.addRoute("::", 0) }
@@ -556,7 +513,6 @@ class AetherVpnService : VpnService() {
             try { builder.addDisallowedApplication(applicationContext.packageName) } catch (_: Exception) {}
 
             val bypassPackages = config.excludedPackages
-
             var bypassedCount = 0
             for (pkg in bypassPackages) {
                 val cleanPkg = pkg.trim()
@@ -620,7 +576,7 @@ class AetherVpnService : VpnService() {
             LogRepository.e("[Tun] [attempt=$attemptId] Failed: builder.establish() returned null prepare=${prep != null}")
             return@runCatching false
         }
-        LogRepository.i("[Tun] [attempt=$attemptId] Established mtu=$effectiveMtu engine=$engine")
+        LogRepository.i("[Tun] [attempt=$attemptId] Established mtu=$effectiveMtu (Sing-box Core)")
         true
     }.getOrElse {
         LogRepository.e("[Tun] [attempt=$attemptId] Failed: ${it.localizedMessage}")
@@ -650,7 +606,6 @@ class AetherVpnService : VpnService() {
         startupJob?.cancel()
         stopStatsJob()
 
-        // Immediately signal Layer-2 tunnels to abort any in-progress blocking handshake
         runCatching { wgExitTunnel?.stop() }
         runCatching { firefoxVpnTunnel?.stop() }
         runCatching { customSocksRelay?.stop() }
@@ -705,8 +660,6 @@ class AetherVpnService : VpnService() {
                 exitTunnelNeedsRefresh = false
                 hevEngine?.requestStop()
                 hevEngine = null
-                socksBridge?.stop()
-                socksBridge = null
                 synchronized(exitTunnelLock) {
                     wgExitTunnel?.stop()
                     wgExitTunnel = null
@@ -722,7 +675,6 @@ class AetherVpnService : VpnService() {
                 closeVpnInterface(attemptId)
                 activeTunnelEngine = null
                 lastHevUpstream = null
-                lastBridgeUpstream = null
                 DnsMap.clear()
             }
             runCatching { if (wakeLock?.isHeld == true) wakeLock?.release() }
@@ -762,67 +714,54 @@ class AetherVpnService : VpnService() {
                 val maxSafeMtu = if (cfg.exitNodeMode == ExitNodeMode.CUSTOM_WG) 1120 else 1280
                 val effectiveMtu = maxSafeMtu.coerceAtMost(cfg.mtu.coerceIn(576, 9000))
 
-                when (activeTunnelEngine) {
-                    TunnelEngine.HEV_TUN2SOCKS -> {
-                        if ((lastHevUpstream != target || shouldRefreshExit) && hevEngine != null && vpnInterface != null) {
-                            stopStatsJob()
-                            val restartDescriptor: ParcelFileDescriptor?
-                            stateMutex.withLock {
-                                hevEngine?.requestStop()
-                                restartDescriptor = vpnInterface
+                if ((lastHevUpstream != target || shouldRefreshExit) && hevEngine != null && vpnInterface != null) {
+                    stopStatsJob()
+                    val restartDescriptor: ParcelFileDescriptor?
+                    stateMutex.withLock {
+                        hevEngine?.requestStop()
+                        restartDescriptor = vpnInterface
+                    }
+                    delay(250.milliseconds)
+                    if (restartDescriptor != null) {
+                        val newEngine = HevTun2SocksEngine()
+                        val hevSettings = HevEngineSettings(
+                            logLevel = cfg.hevLogLevel,
+                            connectTimeoutMs = cfg.hevConnectTimeoutMs,
+                            readWriteTimeoutMs = cfg.hevReadWriteTimeoutMs,
+                            maxSessionCount = cfg.hevMaxSessionCount,
+                            mapdnsCacheSize = cfg.hevMapdnsCacheSize
+                        )
+                        val ok = newEngine.start(
+                            tunPfd = restartDescriptor,
+                            socksAddress = targetHost,
+                            socksPort = targetPort,
+                            mtu = effectiveMtu,
+                            attemptId = activeAttemptId.get(),
+                            settings = hevSettings,
+                            udpMode = if (
+                                ActiveProxyProvider.psiphonProxyUrl != null ||
+                                cfg.chainProvider == ChainProvider.PSIPHON ||
+                                cfg.exitNodeMode == ExitNodeMode.PSIPHON_POOL ||
+                                cfg.exitNodeMode == ExitNodeMode.FIREFOX_VPN ||
+                                cfg.chainProvider == ChainProvider.TOR
+                            ) "tcp" else cfg.hevUdpMode
+                        )
+                        stateMutex.withLock {
+                            if (ok) {
+                                hevEngine = newEngine
+                                lastHevUpstream = target
+                            } else {
+                                hevEngine?.resume()
                             }
-                            delay(250.milliseconds)
-                            if (restartDescriptor != null) {
-                                val newEngine = HevTun2SocksEngine()
-                                val hevSettings = HevEngineSettings(
-                                    logLevel = cfg.hevLogLevel,
-                                    connectTimeoutMs = cfg.hevConnectTimeoutMs,
-                                    readWriteTimeoutMs = cfg.hevReadWriteTimeoutMs,
-                                    maxSessionCount = cfg.hevMaxSessionCount,
-                                    mapdnsCacheSize = cfg.hevMapdnsCacheSize
-                                )
-                                val ok = newEngine.start(
-                                    tunPfd = restartDescriptor,
-                                    socksAddress = targetHost,
-                                    socksPort = targetPort,
-                                    mtu = effectiveMtu,
-                                    attemptId = activeAttemptId.get(),
-                                    settings = hevSettings,
-                                    udpMode = if (
-                                        ActiveProxyProvider.psiphonProxyUrl != null ||
-                                        cfg.chainProvider == ChainProvider.PSIPHON ||
-                                        cfg.exitNodeMode == ExitNodeMode.PSIPHON_POOL ||
-                                        cfg.exitNodeMode == ExitNodeMode.FIREFOX_VPN ||
-                                        cfg.chainProvider == ChainProvider.TOR
-                                    ) "tcp" else cfg.hevUdpMode
-                                )
-                                stateMutex.withLock {
-                                    if (ok) {
-                                        hevEngine = newEngine
-                                        lastHevUpstream = target
-                                    } else {
-                                        hevEngine?.resume()
-                                    }
-                                }
-                            }
-                            if (statsJob == null) startStatsJob()
-                        } else {
-                            hevEngine?.resume()
-                            if (statsJob == null) startStatsJob()
-                            if (lastHevUpstream == null) lastHevUpstream = target
                         }
                     }
-                    TunnelEngine.SOCKS_TUN_BRIDGE -> {
-                        if (lastBridgeUpstream != target && socksBridge != null) {
-                            socksBridge?.updateUpstream(targetHost, targetPort)
-                            lastBridgeUpstream = target
-                        }
-                        if (statsJob == null) startStatsJob()
-                    }
-                    else -> {
-                        if (statsJob == null) startStatsJob()
-                    }
+                    if (statsJob == null) startStatsJob()
+                } else {
+                    hevEngine?.resume()
+                    if (statsJob == null) startStatsJob()
+                    if (lastHevUpstream == null) lastHevUpstream = target
                 }
+
                 DnsMap.clear()
                 routingEngine?.clearCache()
                 if (cfg.exitNodeMode != ExitNodeMode.DIRECT) {
@@ -843,14 +782,6 @@ class AetherVpnService : VpnService() {
     private suspend fun switchHevInternal(host: String, port: Int) {
         val target = "$host:$port"
         SocksGate.setReady(SocksReadiness.PROBED_OK)
-        if (activeTunnelEngine == TunnelEngine.SOCKS_TUN_BRIDGE) {
-            if (lastBridgeUpstream == target || socksBridge == null || vpnInterface == null) return
-            socksBridge?.updateUpstream(host, port)
-            lastBridgeUpstream = target
-            DnsMap.clear()
-            routingEngine?.clearCache()
-            return
-        }
         if (lastHevUpstream == target || hevEngine == null || vpnInterface == null) return
         stopStatsJob()
         var switchDescriptor: ParcelFileDescriptor? = null
@@ -934,18 +865,19 @@ class AetherVpnService : VpnService() {
                         wgExitTunnel = tunnel
                         val started = runCatching { tunnel.start() }.getOrDefault(false)
                         if (started && !isUserInitiatedStop) {
-                            ActiveProxyProvider.customWgPort = localPort
-                            LogRepository.i("[VpnService] WireGuard exit node active on port $localPort (Verified IP: ${tunnel.verifiedExitIp})")
-                            return "127.0.0.1" to localPort
+                            ActiveProxyProvider.customWgPort = tunnel.activePort()
+                            LogRepository.i("[VpnService] Sing-box WireGuard exit node active on port ${tunnel.activePort()} (Verified IP: ${tunnel.verifiedExitIp})")
+                            return "127.0.0.1" to tunnel.activePort()
                         } else {
                             wgExitTunnel = null
-                            val err = tunnel.lastErrorMessage ?: "Layer-2 WireGuard handshake failed"
+                            val err = tunnel.lastErrorMessage ?: "Sing-box WireGuard detour handshake failed"
                             LogRepository.e("[VpnService] $err")
                             throw IllegalStateException(err)
                         }
                     }
-                    ActiveProxyProvider.customWgPort = localPort
-                    return "127.0.0.1" to localPort
+                    val activePort = wgExitTunnel?.activePort() ?: localPort
+                    ActiveProxyProvider.customWgPort = activePort
+                    return "127.0.0.1" to activePort
                 } else {
                     throw IllegalStateException("Custom WireGuard config is incomplete or missing")
                 }
@@ -986,7 +918,7 @@ class AetherVpnService : VpnService() {
                     firefoxVpnTunnel = null
                     val primaryPort = config.socksPort.toIntOrNull() ?: 2021
                     val binaryFile = io.github.immaghzbad.aetherst.core.BinaryManager.prepareSingBoxBinary(this@AetherVpnService)
-                    val tunnel = io.github.immaghzbad.aetherst.shared.net.FirefoxVpnExitTunnel(
+                    val tunnel = FirefoxVpnExitTunnel(
                         token = config.firefoxVpnToken,
                         country = config.firefoxVpnCountry,
                         binaryPath = binaryFile?.absolutePath,
@@ -999,11 +931,11 @@ class AetherVpnService : VpnService() {
                     val started = runCatching { tunnel.start() }.getOrDefault(false)
                     if (started && !isUserInitiatedStop) {
                         ActiveProxyProvider.firefoxVpnPort = localPort
-                        LogRepository.i("[VpnService] Firefox VPN exit node active on port $localPort (Verified IP: ${tunnel.verifiedExitIp})")
+                        LogRepository.i("[VpnService] Sing-box Firefox VPN exit node active on port $localPort (Verified IP: ${tunnel.verifiedExitIp})")
                         return "127.0.0.1" to localPort
                     } else {
                         firefoxVpnTunnel = null
-                        val err = tunnel.lastErrorMessage ?: "Firefox VPN authentication or data-plane failed"
+                        val err = tunnel.lastErrorMessage ?: "Firefox VPN authentication or Sing-box outbound failed"
                         LogRepository.e("[VpnService] $err")
                         throw IllegalStateException(err)
                     }
@@ -1038,14 +970,8 @@ class AetherVpnService : VpnService() {
     }
 
     private fun updateTraffic() {
-        if (activeTunnelEngine == TunnelEngine.HEV_TUN2SOCKS) {
-            hevEngine?.stats?.value?.let {
-                getController().setTraffic(it.txBytes, it.rxBytes)
-            }
-        } else {
-            socksBridge?.getStats()?.let {
-                getController().setTraffic(it.txBytes, it.rxBytes)
-            }
+        hevEngine?.stats?.value?.let {
+            getController().setTraffic(it.txBytes, it.rxBytes)
         }
     }
 
